@@ -15,10 +15,10 @@ use crate::model_provider_info::built_in_model_providers;
 use crate::openai_model_info::get_model_info;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
-use codex_login::AuthMode;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::mcp_protocol::AuthMode;
 use dirs::home_dir;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -188,6 +188,10 @@ pub struct Config {
 
     /// Synchronous hooks configuration.
     pub hooks: HooksConfig,
+
+    /// Temporary feature flag to force-enable reasoning summaries regardless of
+    /// model defaults.
+    pub use_experimental_reasoning_summary: bool,
 }
 
 impl Config {
@@ -484,6 +488,8 @@ pub struct ConfigToml {
     pub experimental_instructions_file: Option<PathBuf>,
 
     pub experimental_use_exec_command_tool: Option<bool>,
+
+    pub use_experimental_reasoning_summary: Option<bool>,
 
     /// The value for the `originator` header included with Responses API requests.
     pub responses_originator_header_internal_override: Option<String>,
@@ -863,6 +869,9 @@ impl Config {
             include_view_image_tool,
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
             hooks: HooksConfig::from_toml(cfg.hooks.clone()),
+            use_experimental_reasoning_summary: cfg
+                .use_experimental_reasoning_summary
+                .unwrap_or(false),
         };
         Ok(config)
     }
@@ -1234,6 +1243,7 @@ disable_response_storage = true
                 include_view_image_tool: true,
                 disable_paste_burst: false,
                 hooks: HooksConfig { pre_tool_use: None, post_tool_use: None, user_prompt_submit: None, stop: None, timeout_ms: 10_000 },
+                use_experimental_reasoning_summary: false,
             },
             o3_profile_config
         );
@@ -1299,6 +1309,7 @@ disable_response_storage = true
                 stop: None,
                 timeout_ms: 10_000,
             },
+            use_experimental_reasoning_summary: false,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -1379,6 +1390,7 @@ disable_response_storage = true
                 stop: None,
                 timeout_ms: 10_000,
             },
+            use_experimental_reasoning_summary: false,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
