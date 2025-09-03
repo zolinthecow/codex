@@ -1053,6 +1053,7 @@ impl Session {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn run_stop_hook(&self, sub_id: &str) {
         let payload = serde_json::json!({
             "type": "stop",
@@ -1063,6 +1064,97 @@ impl Session {
                 .await;
         }
     }
+
+    /// Run the stop hook and parse its stdout for a decision.
+    /// On any error/missing hook/invalid JSON, defaults to Approve.
+    pub async fn check_stop_hook(&self, sub_id: &str) -> StopHookDecision {
+        let Some(argv) = &self.hooks.stop else {
+            return StopHookDecision::Approve;
+        };
+
+        let payload = serde_json::json!({
+            "type": "stop",
+            "sub_id": sub_id,
+        });
+        let json_arg = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                self.send_error_event(sub_id, format!("stop hook payload serialize failed: {e}"))
+                    .await;
+                return StopHookDecision::Approve;
+            }
+        };
+
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        if argv.len() > 1 {
+            cmd.args(&argv[1..]);
+        }
+        cmd.arg(json_arg);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let timeout_dur = std::time::Duration::from_millis(self.hooks.timeout_ms);
+        let output = match tokio::time::timeout(timeout_dur, cmd.output()).await {
+            Err(_) => {
+                self.send_error_event(
+                    sub_id,
+                    format!("stop hook timed out after {} ms", self.hooks.timeout_ms),
+                )
+                .await;
+                return StopHookDecision::Approve;
+            }
+            Ok(Err(e)) => {
+                self.send_error_event(sub_id, format!("failed to spawn stop hook: {e}"))
+                    .await;
+                return StopHookDecision::Approve;
+            }
+            Ok(Ok(o)) => o,
+        };
+
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let snippet: String = stderr.chars().take(512).collect();
+            self.send_error_event(
+                sub_id,
+                format!("stop hook exited with code {code}: {snippet}"),
+            )
+            .await;
+            return StopHookDecision::Approve;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            return StopHookDecision::Approve;
+        }
+
+        let parsed: Result<StopHookOutput, _> = serde_json::from_str(&stdout);
+        match parsed {
+            Ok(StopHookOutput { decision, reason }) => match decision.as_deref() {
+                Some("block") => StopHookDecision::Block(reason.unwrap_or_default()),
+                _ => StopHookDecision::Approve,
+            },
+            Err(e) => {
+                self.send_error_event(sub_id, format!("stop hook returned invalid JSON: {e}"))
+                    .await;
+                StopHookDecision::Approve
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum StopHookDecision {
+    Approve,
+    Block(String),
+}
+
+#[derive(serde::Deserialize)]
+struct StopHookOutput {
+    #[serde(default)]
+    decision: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 impl Drop for Session {
@@ -1467,9 +1559,6 @@ async fn submission_loop(
                     }
                 }
 
-                // Run the synchronous stop hook; errors are surfaced as Error events.
-                sess.run_stop_hook(&sub.id).await;
-
                 let event = Event {
                     id: sub.id.clone(),
                     msg: EventMsg::ShutdownComplete,
@@ -1688,12 +1777,22 @@ async fn run_task(
                     last_agent_message = get_last_assistant_message_from_turn(
                         &items_to_record_in_conversation_history,
                     );
-                    sess.maybe_notify(UserNotification::AgentTurnComplete {
-                        turn_id: sub_id.clone(),
-                        input_messages: turn_input_messages,
-                        last_assistant_message: last_agent_message.clone(),
-                    });
-                    break;
+                    // Consult the stop hook to decide if the turn should end or be blocked.
+                    match sess.check_stop_hook(&sub_id).await {
+                        StopHookDecision::Block(reason) => {
+                            // Feed the reason back into the conversation and continue the turn.
+                            let _ = sess.inject_input(vec![InputItem::Text { text: reason }]);
+                            continue;
+                        }
+                        StopHookDecision::Approve => {
+                            sess.maybe_notify(UserNotification::AgentTurnComplete {
+                                turn_id: sub_id.clone(),
+                                input_messages: turn_input_messages,
+                                last_assistant_message: last_agent_message.clone(),
+                            });
+                            break;
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -1705,8 +1804,17 @@ async fn run_task(
                     }),
                 };
                 sess.tx_event.send(event).await.ok();
-                // let the user continue the conversation
-                break;
+                // Even on error, consult the stop hook to decide whether to keep going.
+                match sess.check_stop_hook(&sub_id).await {
+                    StopHookDecision::Block(reason) => {
+                        let _ = sess.inject_input(vec![InputItem::Text { text: reason }]);
+                        continue;
+                    }
+                    StopHookDecision::Approve => {
+                        // let the user continue the conversation
+                        break;
+                    }
+                }
             }
         }
     }
@@ -2196,7 +2304,9 @@ async fn handle_response_item(
                 ResponseInputItem::FunctionCallOutput { output, .. } => {
                     (output.success, Some(output.content.as_str()))
                 }
-                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                    (None, Some(output.as_str()))
+                }
                 _ => (None, None),
             };
             sess.run_post_tool_hook(
@@ -2301,7 +2411,9 @@ async fn handle_function_call(
                 ResponseInputItem::FunctionCallOutput { output, .. } => {
                     (output.success, Some(output.content.as_str()))
                 }
-                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                    (None, Some(output.as_str()))
+                }
                 _ => (None, None),
             };
             sess.run_post_tool_hook(
@@ -2406,7 +2518,9 @@ async fn handle_function_call(
                 ResponseInputItem::FunctionCallOutput { output, .. } => {
                     (output.success, Some(output.content.as_str()))
                 }
-                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                    (None, Some(output.as_str()))
+                }
                 _ => (None, None),
             };
             sess.run_post_tool_hook(
@@ -2451,7 +2565,9 @@ async fn handle_function_call(
                 ResponseInputItem::FunctionCallOutput { output, .. } => {
                     (output.success, Some(output.content.as_str()))
                 }
-                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                    (None, Some(output.as_str()))
+                }
                 _ => (None, None),
             };
             sess.run_post_tool_hook(
@@ -2505,7 +2621,6 @@ async fn handle_function_call(
                 .handle_exec_command_request(exec_params)
                 .await;
             let function_call_output = crate::exec_command::result_into_payload(result);
-            let call_id_for_post = call_id.clone();
             let call_id_for_post = call_id.clone();
             let resp = ResponseInputItem::FunctionCallOutput {
                 call_id,
@@ -3449,7 +3564,8 @@ mod tests {
         .expect("load config");
 
         let (tx_event, rx_event) = async_channel::unbounded();
-        let auth_manager = AuthManager::shared(config.codex_home.clone(), config.preferred_auth_method);
+        let auth_manager =
+            AuthManager::shared(config.codex_home.clone(), config.preferred_auth_method);
 
         // Mirror Codex::spawn's ConfigureSession
         let user_instructions = crate::project_doc::get_user_instructions(&config).await;
@@ -3468,14 +3584,9 @@ mod tests {
             hooks: config.hooks.clone(),
         };
 
-        let (sess, tc) = Session::new(
-            configure_session,
-            Arc::new(config),
-            auth_manager,
-            tx_event,
-        )
-        .await
-        .expect("session");
+        let (sess, tc) = Session::new(configure_session, Arc::new(config), auth_manager, tx_event)
+            .await
+            .expect("session");
         (sess, tc, rx_event)
     }
 
@@ -3745,14 +3856,13 @@ mod tests {
         )
         .await;
 
-        sess
-            .run_user_prompt_submit_hook(
-                "sub3",
-                &[InputItem::Text {
-                    text: "hello".to_string(),
-                }],
-            )
-            .await;
+        sess.run_user_prompt_submit_hook(
+            "sub3",
+            &[InputItem::Text {
+                text: "hello".to_string(),
+            }],
+        )
+        .await;
 
         let mut saw_error = false;
         while let Ok(ev) = rx.try_recv() {
@@ -3763,7 +3873,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_error, "expected Error event from user_prompt_submit hook failure");
+        assert!(
+            saw_error,
+            "expected Error event from user_prompt_submit hook failure"
+        );
     }
 
     #[tokio::test]
@@ -3791,5 +3904,49 @@ mod tests {
             }
         }
         assert!(saw_error, "expected Error event from stop hook failure");
+    }
+
+    #[tokio::test]
+    async fn stop_hook_check_block_decision() {
+        let tmp = TempDir::new().unwrap();
+        // Script prints a JSON decision to stdout and exits 0
+        let stop_block = write_executable_script(
+            &tmp,
+            "stop_block.sh",
+            "echo '{\"decision\":\"block\",\"reason\":\"fix LSP errors\"}'",
+        );
+        let (sess, _tc, _rx) = make_session_with_hooks(
+            None,
+            None,
+            None,
+            Some(vec![stop_block.to_string_lossy().to_string()]),
+            tmp.path(),
+        )
+        .await;
+
+        match sess.check_stop_hook("sub5").await {
+            StopHookDecision::Block(reason) => assert_eq!(reason, "fix LSP errors"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_hook_check_approve_on_invalid_output() {
+        let tmp = TempDir::new().unwrap();
+        // Prints invalid JSON, should default to Approve
+        let stop_invalid = write_executable_script(&tmp, "stop_invalid.sh", "echo not-json");
+        let (sess, _tc, _rx) = make_session_with_hooks(
+            None,
+            None,
+            None,
+            Some(vec![stop_invalid.to_string_lossy().to_string()]),
+            tmp.path(),
+        )
+        .await;
+
+        match sess.check_stop_hook("sub6").await {
+            StopHookDecision::Approve => {}
+            other => panic!("expected Approve, got {other:?}"),
+        }
     }
 }

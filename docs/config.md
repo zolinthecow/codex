@@ -510,7 +510,14 @@ Semantics:
 - PreToolUse: non‑zero exit aborts the tool and returns a short failure to the model for that `call_id`.
 - PostToolUse: non‑zero exit is logged to the UI but does not alter the tool result.
 - UserPromptSubmit: non‑zero exit is logged; the prompt proceeds.
-- Stop: non‑zero/timeout is logged; shutdown proceeds.
+- Stop: runs at the end of each turn; non‑zero/timeout is logged and processing proceeds.
+
+Stop hook output contract:
+- The stop hook may print a single JSON object to stdout to influence turn completion:
+  - `{ "decision": "approve" | "block" | null, "reason": "string" }`
+- Behavior:
+  - `decision: "block"`: Codex will not end the turn. The `reason` text is injected as a new user message so the agent can continue (e.g., to fix LSP errors). If `reason` is omitted, an empty string is used.
+  - `decision: "approve"` or omitted/invalid output: Codex ends the turn normally.
 
 To have Codex use this script for notifications, you would configure it via `notify` in `~/.codex/config.toml` using the appropriate path to `notify.py` on your computer:
 

@@ -1242,7 +1242,13 @@ disable_response_storage = true
                 use_experimental_streamable_shell_tool: false,
                 include_view_image_tool: true,
                 disable_paste_burst: false,
-                hooks: HooksConfig { pre_tool_use: None, post_tool_use: None, user_prompt_submit: None, stop: None, timeout_ms: 10_000 },
+                hooks: HooksConfig {
+                    pre_tool_use: None,
+                    post_tool_use: None,
+                    user_prompt_submit: None,
+                    stop: None,
+                    timeout_ms: 10_000
+                },
                 use_experimental_reasoning_summary: false,
             },
             o3_profile_config
