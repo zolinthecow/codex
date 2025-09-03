@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -41,6 +42,7 @@ use crate::client::ModelClient;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::config::Config;
+use crate::config::HooksConfig;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::conversation_history::ConversationHistory;
 use crate::environment_context::EnvironmentContext;
@@ -192,6 +194,7 @@ impl Codex {
             notify: config.notify.clone(),
             cwd: config.cwd.clone(),
             resume_path,
+            hooks: config.hooks.clone(),
         };
 
         // Generate a unique ID for the lifetime of this Codex session.
@@ -288,6 +291,8 @@ pub(crate) struct Session {
     codex_linux_sandbox_exe: Option<PathBuf>,
     user_shell: shell::Shell,
     show_raw_agent_reasoning: bool,
+    /// Hooks configuration for synchronous hook execution.
+    hooks: HooksConfig,
 }
 
 /// The context needed for a single turn of the conversation.
@@ -354,6 +359,8 @@ struct ConfigureSession {
     cwd: PathBuf,
 
     resume_path: Option<PathBuf>,
+    /// Hooks configuration resolved from config.
+    hooks: HooksConfig,
 }
 
 impl Session {
@@ -377,6 +384,7 @@ impl Session {
             notify,
             cwd,
             resume_path,
+            hooks,
         } = configure_session;
         debug!("Configuring session: model={model}; provider={provider:?}");
         if !cwd.is_absolute() {
@@ -543,6 +551,7 @@ impl Session {
             codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
             user_shell: default_shell,
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+            hooks,
         });
 
         // record the initial user instructions and environment context,
@@ -958,6 +967,146 @@ impl Session {
             warn!("failed to spawn notifier '{}': {e}", notify_command[0]);
         }
     }
+
+    /// Helper: send an error event associated with a submission id.
+    async fn send_error_event(&self, sub_id: &str, message: String) {
+        let _ = self
+            .tx_event
+            .send(Event {
+                id: sub_id.to_string(),
+                msg: EventMsg::Error(ErrorEvent { message }),
+            })
+            .await;
+    }
+
+    async fn run_hook_argv(&self, argv: &[String], json_arg: &str) -> Result<(), String> {
+        if argv.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        if argv.len() > 1 {
+            cmd.args(&argv[1..]);
+        }
+        cmd.arg(json_arg);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let timeout_dur = std::time::Duration::from_millis(self.hooks.timeout_ms);
+        match tokio::time::timeout(timeout_dur, cmd.output()).await {
+            Err(_) => Err(format!("hook timed out after {} ms", self.hooks.timeout_ms)),
+            Ok(Err(e)) => Err(format!("failed to spawn hook: {e}")),
+            Ok(Ok(output)) => {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    let code = output.status.code().unwrap_or(-1);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let snippet: String = stderr.chars().take(512).collect();
+                    Err(format!("hook exited with code {code}: {snippet}"))
+                }
+            }
+        }
+    }
+
+    async fn maybe_run_hook_json(
+        &self,
+        argv: &Option<Vec<String>>,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        match argv {
+            None => Ok(()),
+            Some(cmd) => {
+                let json = serde_json::to_string(&payload)
+                    .map_err(|e| format!("failed to serialize hook payload: {e}"))?;
+                self.run_hook_argv(cmd, &json).await
+            }
+        }
+    }
+
+    pub async fn run_user_prompt_submit_hook(&self, sub_id: &str, items: &[InputItem]) {
+        let mut texts = Vec::new();
+        let mut images = Vec::new();
+        for it in items {
+            match it {
+                InputItem::Text { text } => texts.push(text.clone()),
+                InputItem::LocalImage { path } => images.push(path.to_string_lossy().to_string()),
+                InputItem::Image { image_url } => images.push(image_url.clone()),
+                _ => (),
+            }
+        }
+        let payload = serde_json::json!({
+            "type": "user-prompt-submit",
+            "sub_id": sub_id,
+            "texts": texts,
+            "images": images,
+        });
+        if let Err(e) = self
+            .maybe_run_hook_json(&self.hooks.user_prompt_submit, payload)
+            .await
+        {
+            self.send_error_event(sub_id, format!("user_prompt_submit hook failed: {e}"))
+                .await;
+        }
+    }
+
+    pub async fn run_pre_tool_hook(
+        &self,
+        sub_id: &str,
+        call_id: &str,
+        tool: &str,
+        cwd: &Path,
+        arguments: serde_json::Value,
+    ) -> Result<(), String> {
+        let payload = serde_json::json!({
+            "type": "pre-tool-use",
+            "sub_id": sub_id,
+            "call_id": call_id,
+            "tool": tool,
+            "cwd": cwd.to_string_lossy(),
+            "arguments": arguments,
+        });
+        self.maybe_run_hook_json(&self.hooks.pre_tool_use, payload)
+            .await
+    }
+
+    pub async fn run_post_tool_hook(
+        &self,
+        sub_id: &str,
+        call_id: &str,
+        tool: &str,
+        cwd: &Path,
+        success: Option<bool>,
+        output: Option<&str>,
+    ) {
+        let limited = output.map(|s| s.chars().take(4096).collect::<String>());
+        let payload = serde_json::json!({
+            "type": "post-tool-use",
+            "sub_id": sub_id,
+            "call_id": call_id,
+            "tool": tool,
+            "cwd": cwd.to_string_lossy(),
+            "success": success,
+            "output": limited,
+        });
+        if let Err(e) = self
+            .maybe_run_hook_json(&self.hooks.post_tool_use, payload)
+            .await
+        {
+            self.send_error_event(sub_id, format!("post_tool_use hook failed: {e}"))
+                .await;
+        }
+    }
+
+    pub async fn run_stop_hook(&self, sub_id: &str) {
+        let payload = serde_json::json!({
+            "type": "stop",
+            "sub_id": sub_id,
+        });
+        if let Err(e) = self.maybe_run_hook_json(&self.hooks.stop, payload).await {
+            self.send_error_event(sub_id, format!("stop hook failed: {e}"))
+                .await;
+        }
+    }
 }
 
 impl Drop for Session {
@@ -1150,6 +1299,8 @@ async fn submission_loop(
                 }
             }
             Op::UserInput { items } => {
+                // Synchronous hook for user prompt submission; errors are logged.
+                sess.run_user_prompt_submit_hook(&sub.id, &items).await;
                 // attempt to inject input into current task
                 if let Err(items) = sess.inject_input(items) {
                     // no current task, spawn a new one
@@ -1167,6 +1318,8 @@ async fn submission_loop(
                 effort,
                 summary,
             } => {
+                // Synchronous hook for user prompt submission; errors are logged.
+                sess.run_user_prompt_submit_hook(&sub.id, &items).await;
                 // attempt to inject input into current task
                 if let Err(items) = sess.inject_input(items) {
                     // Derive a fresh TurnContext for this turn using the provided overrides.
@@ -1357,6 +1510,9 @@ async fn submission_loop(
                         warn!("failed to send error message: {e:?}");
                     }
                 }
+
+                // Run the synchronous stop hook; errors are surfaced as Error events.
+                sess.run_stop_hook(&sub.id).await;
 
                 let event = Event {
                     id: sub.id.clone(),
@@ -2045,17 +2201,58 @@ async fn handle_response_item(
             };
 
             let exec_params = to_exec_params(params, turn_context);
-            Some(
-                handle_container_exec_with_params(
-                    exec_params,
-                    sess,
-                    turn_context,
-                    turn_diff_tracker,
-                    sub_id.to_string(),
-                    effective_call_id,
+            // Pre‑tool hook for LocalShellCall
+            let hook_args = serde_json::json!({
+                "command": exec_params.command,
+                "workdir": exec_params.cwd,
+                "timeout_ms": exec_params.timeout_ms,
+            });
+            if let Err(e) = sess
+                .run_pre_tool_hook(
+                    sub_id,
+                    &effective_call_id,
+                    "shell",
+                    &turn_context.cwd,
+                    hook_args,
                 )
-                .await,
+                .await
+            {
+                return Ok(Some(ResponseInputItem::FunctionCallOutput {
+                    call_id: effective_call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("pre_tool_use hook failed: {e}"),
+                        success: Some(false),
+                    },
+                }));
+            }
+
+            let resp = handle_container_exec_with_params(
+                exec_params,
+                sess,
+                turn_context,
+                turn_diff_tracker,
+                sub_id.to_string(),
+                effective_call_id.clone(),
             )
+            .await;
+
+            let (success, output_str) = match &resp {
+                ResponseInputItem::FunctionCallOutput { output, .. } => {
+                    (output.success, Some(output.content.as_str()))
+                }
+                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                _ => (None, None),
+            };
+            sess.run_post_tool_hook(
+                sub_id,
+                &effective_call_id,
+                "shell",
+                &turn_context.cwd,
+                success,
+                output_str,
+            )
+            .await;
+            Some(resp)
         }
         ResponseItem::CustomToolCall {
             id: _,
@@ -2110,21 +2307,62 @@ async fn handle_function_call(
 ) -> ResponseInputItem {
     match name.as_str() {
         "container.exec" | "shell" => {
-            let params = match parse_container_exec_arguments(arguments, turn_context, &call_id) {
-                Ok(params) => params,
-                Err(output) => {
-                    return *output;
-                }
-            };
-            handle_container_exec_with_params(
+            let params =
+                match parse_container_exec_arguments(arguments.clone(), turn_context, &call_id) {
+                    Ok(params) => params,
+                    Err(output) => {
+                        return *output;
+                    }
+                };
+            // Pre‑tool hook: fail the tool if hook exits non‑zero.
+            let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+            if let Err(e) = sess
+                .run_pre_tool_hook(&sub_id, &call_id, "shell", &turn_context.cwd, arg_json)
+                .await
+            {
+                return ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("pre_tool_use hook failed: {e}"),
+                        success: Some(false),
+                    },
+                };
+            }
+
+            let resp = handle_container_exec_with_params(
                 params,
                 sess,
                 turn_context,
                 turn_diff_tracker,
-                sub_id,
-                call_id,
+                sub_id.clone(),
+                call_id.clone(),
             )
-            .await
+            .await;
+
+            // Post‑tool hook (non‑blocking semantics re: model output): errors are logged.
+            let (success, output_str) = match &resp {
+                ResponseInputItem::FunctionCallOutput { output, .. } => {
+                    (output.success, Some(output.content.as_str()))
+                }
+                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                _ => (None, None),
+            };
+            sess.run_post_tool_hook(
+                &sub_id,
+                match &resp {
+                    ResponseInputItem::FunctionCallOutput { call_id, .. } => call_id,
+                    ResponseInputItem::CustomToolCallOutput { call_id, .. } => call_id,
+                    _ => &call_id,
+                },
+                "shell",
+                &turn_context.cwd,
+                success,
+                output_str,
+            )
+            .await;
+
+            resp
         }
         "view_image" => {
             #[derive(serde::Deserialize)]
@@ -2169,6 +2407,27 @@ async fn handle_function_call(
                     };
                 }
             };
+            // Pre‑tool hook
+            let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+            if let Err(e) = sess
+                .run_pre_tool_hook(
+                    &sub_id,
+                    &call_id,
+                    "apply_patch",
+                    &turn_context.cwd,
+                    arg_json,
+                )
+                .await
+            {
+                return ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("pre_tool_use hook failed: {e}"),
+                        success: Some(false),
+                    },
+                };
+            }
             let exec_params = ExecParams {
                 command: vec!["apply_patch".to_string(), args.input.clone()],
                 cwd: turn_context.cwd.clone(),
@@ -2177,17 +2436,79 @@ async fn handle_function_call(
                 with_escalated_permissions: None,
                 justification: None,
             };
-            handle_container_exec_with_params(
+            let resp = handle_container_exec_with_params(
                 exec_params,
                 sess,
                 turn_context,
                 turn_diff_tracker,
-                sub_id,
-                call_id,
+                sub_id.clone(),
+                call_id.clone(),
             )
-            .await
+            .await;
+
+            let (success, output_str) = match &resp {
+                ResponseInputItem::FunctionCallOutput { output, .. } => {
+                    (output.success, Some(output.content.as_str()))
+                }
+                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                _ => (None, None),
+            };
+            sess.run_post_tool_hook(
+                &sub_id,
+                match &resp {
+                    ResponseInputItem::FunctionCallOutput { call_id, .. } => call_id,
+                    ResponseInputItem::CustomToolCallOutput { call_id, .. } => call_id,
+                    _ => &call_id,
+                },
+                "apply_patch",
+                &turn_context.cwd,
+                success,
+                output_str,
+            )
+            .await;
+
+            resp
         }
-        "update_plan" => handle_update_plan(sess, arguments, sub_id, call_id).await,
+        "update_plan" => {
+            let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+            if let Err(e) = sess
+                .run_pre_tool_hook(
+                    &sub_id,
+                    &call_id,
+                    "update_plan",
+                    &turn_context.cwd,
+                    arg_json,
+                )
+                .await
+            {
+                return ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("pre_tool_use hook failed: {e}"),
+                        success: Some(false),
+                    },
+                };
+            }
+            let resp = handle_update_plan(sess, arguments, sub_id.clone(), call_id.clone()).await;
+            let (success, output_str) = match &resp {
+                ResponseInputItem::FunctionCallOutput { output, .. } => {
+                    (output.success, Some(output.content.as_str()))
+                }
+                ResponseInputItem::CustomToolCallOutput { output, .. } => (None, Some(output.as_str())),
+                _ => (None, None),
+            };
+            sess.run_post_tool_hook(
+                &sub_id,
+                &call_id,
+                "update_plan",
+                &turn_context.cwd,
+                success,
+                output_str,
+            )
+            .await;
+            resp
+        }
         EXEC_COMMAND_TOOL_NAME => {
             // TODO(mbolin): Sandbox check.
             let exec_params = match serde_json::from_str::<ExecCommandParams>(&arguments) {
@@ -2202,15 +2523,54 @@ async fn handle_function_call(
                     };
                 }
             };
+            // Pre‑tool hook
+            let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+            if let Err(e) = sess
+                .run_pre_tool_hook(
+                    &sub_id,
+                    &call_id,
+                    EXEC_COMMAND_TOOL_NAME,
+                    &turn_context.cwd,
+                    arg_json,
+                )
+                .await
+            {
+                return ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("pre_tool_use hook failed: {e}"),
+                        success: Some(false),
+                    },
+                };
+            }
             let result = sess
                 .session_manager
                 .handle_exec_command_request(exec_params)
                 .await;
             let function_call_output = crate::exec_command::result_into_payload(result);
-            ResponseInputItem::FunctionCallOutput {
+            let call_id_for_post = call_id.clone();
+            let call_id_for_post = call_id.clone();
+            let resp = ResponseInputItem::FunctionCallOutput {
                 call_id,
                 output: function_call_output,
-            }
+            };
+            let (success, output_str) = match &resp {
+                ResponseInputItem::FunctionCallOutput { output, .. } => {
+                    (output.success, Some(output.content.as_str()))
+                }
+                _ => (None, None),
+            };
+            sess.run_post_tool_hook(
+                &sub_id,
+                &call_id_for_post,
+                EXEC_COMMAND_TOOL_NAME,
+                &turn_context.cwd,
+                success,
+                output_str,
+            )
+            .await;
+            resp
         }
         WRITE_STDIN_TOOL_NAME => {
             let write_stdin_params = match serde_json::from_str::<WriteStdinParams>(&arguments) {
@@ -2225,26 +2585,105 @@ async fn handle_function_call(
                     };
                 }
             };
+            // Pre‑tool hook
+            let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+            if let Err(e) = sess
+                .run_pre_tool_hook(
+                    &sub_id,
+                    &call_id,
+                    WRITE_STDIN_TOOL_NAME,
+                    &turn_context.cwd,
+                    arg_json,
+                )
+                .await
+            {
+                return ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("pre_tool_use hook failed: {e}"),
+                        success: Some(false),
+                    },
+                };
+            }
             let result = sess
                 .session_manager
                 .handle_write_stdin_request(write_stdin_params)
                 .await;
             let function_call_output: FunctionCallOutputPayload =
                 crate::exec_command::result_into_payload(result);
-            ResponseInputItem::FunctionCallOutput {
+            let call_id_for_post = call_id.clone();
+            let resp = ResponseInputItem::FunctionCallOutput {
                 call_id,
                 output: function_call_output,
-            }
+            };
+            let (success, output_str) = match &resp {
+                ResponseInputItem::FunctionCallOutput { output, .. } => {
+                    (output.success, Some(output.content.as_str()))
+                }
+                _ => (None, None),
+            };
+            sess.run_post_tool_hook(
+                &sub_id,
+                &call_id_for_post,
+                WRITE_STDIN_TOOL_NAME,
+                &turn_context.cwd,
+                success,
+                output_str,
+            )
+            .await;
+            resp
         }
         _ => {
             match sess.mcp_connection_manager.parse_tool_name(&name) {
                 Some((server, tool_name)) => {
                     // TODO(mbolin): Determine appropriate timeout for tool call.
                     let timeout = None;
-                    handle_mcp_tool_call(
-                        sess, &sub_id, call_id, server, tool_name, arguments, timeout,
+                    // Pre‑tool hook for MCP tool
+                    let tool_id = format!("mcp:{server}.{tool_name}");
+                    let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+                    if let Err(e) = sess
+                        .run_pre_tool_hook(&sub_id, &call_id, &tool_id, &turn_context.cwd, arg_json)
+                        .await
+                    {
+                        return ResponseInputItem::FunctionCallOutput {
+                            call_id,
+                            output: FunctionCallOutputPayload {
+                                content: format!("pre_tool_use hook failed: {e}"),
+                                success: Some(false),
+                            },
+                        };
+                    }
+                    let resp = handle_mcp_tool_call(
+                        sess,
+                        &sub_id,
+                        call_id.clone(),
+                        server,
+                        tool_name,
+                        arguments,
+                        timeout,
                     )
-                    .await
+                    .await;
+                    let (success, output_str) = match &resp {
+                        ResponseInputItem::FunctionCallOutput { output, .. } => {
+                            (output.success, Some(output.content.as_str()))
+                        }
+                        ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                            (None, Some(output.as_str()))
+                        }
+                        _ => (None, None),
+                    };
+                    sess.run_post_tool_hook(
+                        &sub_id,
+                        &call_id,
+                        &tool_id,
+                        &turn_context.cwd,
+                        success,
+                        output_str,
+                    )
+                    .await;
+                    resp
                 }
                 None => {
                     // Unknown function: reply with structured failure so the model can adapt.
@@ -2281,12 +2720,32 @@ async fn handle_custom_tool_call(
                 with_escalated_permissions: None,
                 justification: None,
             };
+            // Pre‑tool hook
+            let hook_args = serde_json::json!({ "raw": input });
+            if let Err(e) = sess
+                .run_pre_tool_hook(
+                    &sub_id,
+                    &call_id,
+                    "apply_patch",
+                    &turn_context.cwd,
+                    hook_args,
+                )
+                .await
+            {
+                return ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload {
+                        content: format!("pre_tool_use hook failed: {e}"),
+                        success: Some(false),
+                    },
+                };
+            }
             let resp = handle_container_exec_with_params(
                 exec_params,
                 sess,
                 turn_context,
                 turn_diff_tracker,
-                sub_id,
+                sub_id.clone(),
                 call_id,
             )
             .await;
@@ -2294,9 +2753,19 @@ async fn handle_custom_tool_call(
             // Convert function-call style output into a custom tool call output
             match resp {
                 ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                    let out_str = output.content.clone();
+                    sess.run_post_tool_hook(
+                        &sub_id,
+                        &call_id,
+                        "apply_patch",
+                        &turn_context.cwd,
+                        output.success,
+                        Some(&out_str),
+                    )
+                    .await;
                     ResponseInputItem::CustomToolCallOutput {
                         call_id,
-                        output: output.content,
+                        output: out_str,
                     }
                 }
                 // Pass through if already a custom tool output or other variant
@@ -2974,6 +3443,87 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::time::Duration as StdDuration;
+    use tempfile::TempDir;
+
+    fn write_executable_script(dir: &TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).expect("create script");
+        // Always use POSIX sh to maximize portability across CI/macOS.
+        writeln!(f, "#!/bin/sh\n{body}").expect("write script");
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perm = std::fs::metadata(&path).expect("stat").permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&path, perm).expect("chmod");
+        }
+        path
+    }
+
+    async fn make_session_with_hooks(
+        pre: Option<Vec<String>>,
+        post: Option<Vec<String>>,
+        user_prompt_submit: Option<Vec<String>>,
+        stop: Option<Vec<String>>,
+        cwd: &std::path::Path,
+    ) -> (Arc<Session>, TurnContext, async_channel::Receiver<Event>) {
+        // Minimal TOML config with hooks injected
+        let mut cfg = crate::config::ConfigToml::default();
+        cfg.model = Some("gpt-3.5-turbo".to_string());
+        cfg.hooks = Some(crate::config::HooksToml {
+            pre_tool_use: pre,
+            post_tool_use: post,
+            user_prompt_submit,
+            stop,
+            timeout_ms: Some(2_000),
+        });
+
+        let overrides = crate::config::ConfigOverrides {
+            cwd: Some(cwd.to_path_buf()),
+            ..Default::default()
+        };
+        let codex_home = TempDir::new().unwrap();
+        let config = crate::config::Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("load config");
+
+        let (tx_event, rx_event) = async_channel::unbounded();
+        let auth_manager = AuthManager::shared(config.codex_home.clone(), config.preferred_auth_method);
+
+        // Mirror Codex::spawn's ConfigureSession
+        let user_instructions = crate::project_doc::get_user_instructions(&config).await;
+        let configure_session = ConfigureSession {
+            provider: config.model_provider.clone(),
+            model: config.model.clone(),
+            model_reasoning_effort: config.model_reasoning_effort,
+            model_reasoning_summary: config.model_reasoning_summary,
+            user_instructions,
+            base_instructions: config.base_instructions.clone(),
+            approval_policy: config.approval_policy,
+            sandbox_policy: config.sandbox_policy.clone(),
+            disable_response_storage: config.disable_response_storage,
+            notify: config.notify.clone(),
+            cwd: config.cwd.clone(),
+            resume_path: None,
+            hooks: config.hooks.clone(),
+        };
+
+        let (sess, tc) = Session::new(
+            configure_session,
+            Arc::new(config),
+            auth_manager,
+            tx_event,
+            None,
+        )
+        .await
+        .expect("session");
+        (sess, tc, rx_event)
+    }
 
     fn text_block(s: &str) -> ContentBlock {
         ContentBlock::TextContent(TextContent {
@@ -3134,5 +3684,158 @@ mod tests {
         };
 
         assert_eq!(expected, got);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_aborts_shell_call() {
+        let tmp = TempDir::new().unwrap();
+        let hook = write_executable_script(&tmp, "pre_fail.sh", "exit 7");
+        let (sess, tc, _rx) = make_session_with_hooks(
+            Some(vec![hook.to_string_lossy().to_string()]),
+            None,
+            None,
+            None,
+            tmp.path(),
+        )
+        .await;
+
+        let args = serde_json::to_string(&json!({
+            "command": ["sh", "-c", "echo hi"],
+            "workdir": null,
+            "timeout_ms": null
+        }))
+        .unwrap();
+
+        let out = handle_function_call(
+            &sess,
+            &tc,
+            &mut TurnDiffTracker::new(),
+            "sub1".to_string(),
+            "shell".to_string(),
+            args,
+            "c1".to_string(),
+        )
+        .await;
+
+        match out {
+            ResponseInputItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(output.success, Some(false));
+                assert!(output.content.contains("pre_tool_use hook failed"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_hook_error_is_logged_not_altering_result() {
+        let tmp = TempDir::new().unwrap();
+        let pre_ok = write_executable_script(&tmp, "pre_ok.sh", "exit 0");
+        let post_fail = write_executable_script(&tmp, "post_fail.sh", "echo hookerr 1>&2; exit 9");
+        let (sess, tc, rx) = make_session_with_hooks(
+            Some(vec![pre_ok.to_string_lossy().to_string()]),
+            Some(vec![post_fail.to_string_lossy().to_string()]),
+            None,
+            None,
+            tmp.path(),
+        )
+        .await;
+
+        let args = serde_json::to_string(&json!({
+            "command": ["sh", "-c", "true"],
+            "workdir": null,
+            "timeout_ms": null
+        }))
+        .unwrap();
+
+        let out = handle_function_call(
+            &sess,
+            &tc,
+            &mut TurnDiffTracker::new(),
+            "sub2".to_string(),
+            "shell".to_string(),
+            args,
+            "c2".to_string(),
+        )
+        .await;
+
+        match out {
+            ResponseInputItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(output.success, Some(true));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // Drain events; expect an Error event from the post hook failure
+        let mut saw_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EventMsg::Error(ErrorEvent { message }) = ev.msg {
+                if message.contains("post_tool_use hook failed") {
+                    saw_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_error, "expected Error event from post hook failure");
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_hook_errors_are_logged() {
+        let tmp = TempDir::new().unwrap();
+        let ups_fail = write_executable_script(&tmp, "ups_fail.sh", "exit 3");
+        let (sess, _tc, rx) = make_session_with_hooks(
+            None,
+            None,
+            Some(vec![ups_fail.to_string_lossy().to_string()]),
+            None,
+            tmp.path(),
+        )
+        .await;
+
+        sess
+            .run_user_prompt_submit_hook(
+                "sub3",
+                &[InputItem::Text {
+                    text: "hello".to_string(),
+                }],
+            )
+            .await;
+
+        let mut saw_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EventMsg::Error(ErrorEvent { message }) = ev.msg {
+                if message.contains("user_prompt_submit hook failed") {
+                    saw_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_error, "expected Error event from user_prompt_submit hook failure");
+    }
+
+    #[tokio::test]
+    async fn stop_hook_errors_are_logged() {
+        let tmp = TempDir::new().unwrap();
+        let stop_fail = write_executable_script(&tmp, "stop_fail.sh", "exit 5");
+        let (sess, _tc, rx) = make_session_with_hooks(
+            None,
+            None,
+            None,
+            Some(vec![stop_fail.to_string_lossy().to_string()]),
+            tmp.path(),
+        )
+        .await;
+
+        sess.run_stop_hook("sub4").await;
+
+        let mut saw_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EventMsg::Error(ErrorEvent { message }) = ev.msg {
+                if message.contains("stop hook failed") {
+                    saw_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_error, "expected Error event from stop hook failure");
     }
 }

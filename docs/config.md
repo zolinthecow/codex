@@ -483,6 +483,35 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
+## hooks
+
+Run user-defined programs synchronously at specific points in the agent lifecycle. Each hook is configured as an argv array and receives a single JSON argument appended as the last token. Codex waits for the hook to finish; timeouts and non‑zero exits are handled per hook type below.
+
+Config example:
+
+```toml
+[hooks]
+pre_tool_use = ["/usr/local/bin/my-pre-hook"]
+post_tool_use = ["/usr/local/bin/my-post-hook"]
+user_prompt_submit = ["/usr/local/bin/my-prompt-hook"]
+stop = ["/usr/local/bin/my-stop-hook"]
+# Optional timeout (ms); defaults to 10000
+timeout_ms = 10000
+```
+
+Payloads:
+- PreToolUse: `{ "type": "pre-tool-use", "sub_id": "...", "call_id": "...", "tool": "shell|apply_patch|update_plan|exec_command|write_stdin|mcp:<server>.<tool>", "cwd": "<abs>", "arguments": <json or {raw: string}> }`
+- PostToolUse: `{ "type": "post-tool-use", "sub_id": "...", "call_id": "...", "tool": "...", "cwd": "<abs>", "success": true|false|null, "output": "<string>" }`
+- UserPromptSubmit: `{ "type": "user-prompt-submit", "sub_id": "...", "texts": ["..."], "images": ["<path or data URL>"] }`
+- Stop: `{ "type": "stop", "sub_id": "..." }`
+
+Semantics:
+- Hooks are synchronous. Codex waits up to `hooks.timeout_ms` for completion.
+- PreToolUse: non‑zero exit aborts the tool and returns a short failure to the model for that `call_id`.
+- PostToolUse: non‑zero exit is logged to the UI but does not alter the tool result.
+- UserPromptSubmit: non‑zero exit is logged; the prompt proceeds.
+- Stop: non‑zero/timeout is logged; shutdown proceeds.
+
 To have Codex use this script for notifications, you would configure it via `notify` in `~/.codex/config.toml` using the appropriate path to `notify.py` on your computer:
 
 ```toml

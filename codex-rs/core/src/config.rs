@@ -185,6 +185,9 @@ pub struct Config {
     /// All characters are inserted as they are received, and no buffering
     /// or placeholder replacement will occur for fast keypress bursts.
     pub disable_paste_burst: bool,
+
+    /// Synchronous hooks configuration.
+    pub hooks: HooksConfig,
 }
 
 impl Config {
@@ -497,6 +500,9 @@ pub struct ConfigToml {
     /// All characters are inserted as they are received, and no buffering
     /// or placeholder replacement will occur for fast keypress bursts.
     pub disable_paste_burst: Option<bool>,
+
+    /// Optional hooks configuration.
+    pub hooks: Option<HooksToml>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -512,6 +518,55 @@ pub struct ToolsToml {
     /// Enable the `view_image` tool that lets the agent attach local images.
     #[serde(default)]
     pub view_image: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HooksConfig {
+    pub pre_tool_use: Option<Vec<String>>,
+    pub post_tool_use: Option<Vec<String>>,
+    pub user_prompt_submit: Option<Vec<String>>,
+    pub stop: Option<Vec<String>>,
+    pub timeout_ms: u64,
+}
+
+impl HooksConfig {
+    fn from_toml(toml: Option<HooksToml>) -> Self {
+        let default_timeout = 10_000u64;
+        match toml {
+            Some(HooksToml {
+                pre_tool_use,
+                post_tool_use,
+                user_prompt_submit,
+                stop,
+                timeout_ms,
+            }) => HooksConfig {
+                pre_tool_use,
+                post_tool_use,
+                user_prompt_submit,
+                stop,
+                timeout_ms: timeout_ms.unwrap_or(default_timeout),
+            },
+            None => HooksConfig {
+                timeout_ms: default_timeout,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct HooksToml {
+    #[serde(default)]
+    pub pre_tool_use: Option<Vec<String>>,
+    #[serde(default)]
+    pub post_tool_use: Option<Vec<String>>,
+    #[serde(default)]
+    pub user_prompt_submit: Option<Vec<String>>,
+    #[serde(default)]
+    pub stop: Option<Vec<String>>,
+    /// Optional timeout for hooks in milliseconds (default 10s).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl ConfigToml {
@@ -807,6 +862,7 @@ impl Config {
                 .unwrap_or(false),
             include_view_image_tool,
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
+            hooks: HooksConfig::from_toml(cfg.hooks.clone()),
         };
         Ok(config)
     }
@@ -1177,6 +1233,7 @@ disable_response_storage = true
                 use_experimental_streamable_shell_tool: false,
                 include_view_image_tool: true,
                 disable_paste_burst: false,
+                hooks: HooksConfig { pre_tool_use: None, post_tool_use: None, user_prompt_submit: None, stop: None, timeout_ms: 10_000 },
             },
             o3_profile_config
         );
@@ -1235,6 +1292,13 @@ disable_response_storage = true
             use_experimental_streamable_shell_tool: false,
             include_view_image_tool: true,
             disable_paste_burst: false,
+            hooks: HooksConfig {
+                pre_tool_use: None,
+                post_tool_use: None,
+                user_prompt_submit: None,
+                stop: None,
+                timeout_ms: 10_000,
+            },
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -1308,6 +1372,13 @@ disable_response_storage = true
             use_experimental_streamable_shell_tool: false,
             include_view_image_tool: true,
             disable_paste_burst: false,
+            hooks: HooksConfig {
+                pre_tool_use: None,
+                post_tool_use: None,
+                user_prompt_submit: None,
+                stop: None,
+                timeout_ms: 10_000,
+            },
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
