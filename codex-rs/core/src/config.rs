@@ -1,12 +1,12 @@
 use crate::config_profile::ConfigProfile;
 use crate::config_types::History;
 use crate::config_types::McpServerConfig;
+use crate::config_types::ReasoningSummaryFormat;
 use crate::config_types::SandboxWorkspaceWrite;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::config_types::ShellEnvironmentPolicyToml;
 use crate::config_types::Tui;
 use crate::config_types::UriBasedFileOpener;
-use crate::config_types::Verbosity;
 use crate::git_info::resolve_root_git_project_for_trust;
 use crate::model_family::ModelFamily;
 use crate::model_family::find_family_for_model;
@@ -18,7 +18,10 @@ use crate::protocol::SandboxPolicy;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::Verbosity;
 use codex_protocol::mcp_protocol::AuthMode;
+use codex_protocol::mcp_protocol::Tools;
+use codex_protocol::mcp_protocol::UserSavedConfig;
 use dirs::home_dir;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -74,11 +77,6 @@ pub struct Config {
     /// When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output.
     /// Defaults to `false`.
     pub show_raw_agent_reasoning: bool,
-
-    /// Disable server-side response storage (sends the full conversation
-    /// context with every request). Currently necessary for OpenAI customers
-    /// who have opted into Zero Data Retention (ZDR).
-    pub disable_response_storage: bool,
 
     /// User-provided instructions from AGENTS.md.
     pub user_instructions: Option<String>,
@@ -188,10 +186,6 @@ pub struct Config {
 
     /// Synchronous hooks configuration.
     pub hooks: HooksConfig,
-
-    /// Temporary feature flag to force-enable reasoning summaries regardless of
-    /// model defaults.
-    pub use_experimental_reasoning_summary: bool,
 }
 
 impl Config {
@@ -421,11 +415,6 @@ pub struct ConfigToml {
     /// Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`.
     pub sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
 
-    /// Disable server-side response storage (sends the full conversation
-    /// context with every request). Currently necessary for OpenAI customers
-    /// who have opted into Zero Data Retention (ZDR).
-    pub disable_response_storage: Option<bool>,
-
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
     pub notify: Option<Vec<String>>,
@@ -478,6 +467,9 @@ pub struct ConfigToml {
     /// Override to force-enable reasoning summaries for the configured model.
     pub model_supports_reasoning_summaries: Option<bool>,
 
+    /// Override to force reasoning summary format for the configured model.
+    pub model_reasoning_summary_format: Option<ReasoningSummaryFormat>,
+
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: Option<String>,
 
@@ -488,8 +480,6 @@ pub struct ConfigToml {
     pub experimental_instructions_file: Option<PathBuf>,
 
     pub experimental_use_exec_command_tool: Option<bool>,
-
-    pub use_experimental_reasoning_summary: Option<bool>,
 
     /// The value for the `originator` header included with Responses API requests.
     pub responses_originator_header_internal_override: Option<String>,
@@ -509,6 +499,29 @@ pub struct ConfigToml {
 
     /// Optional hooks configuration.
     pub hooks: Option<HooksToml>,
+}
+
+impl From<ConfigToml> for UserSavedConfig {
+    fn from(config_toml: ConfigToml) -> Self {
+        let profiles = config_toml
+            .profiles
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect();
+
+        Self {
+            approval_policy: config_toml.approval_policy,
+            sandbox_mode: config_toml.sandbox_mode,
+            sandbox_settings: config_toml.sandbox_workspace_write.map(From::from),
+            model: config_toml.model,
+            model_reasoning_effort: config_toml.model_reasoning_effort,
+            model_reasoning_summary: config_toml.model_reasoning_summary,
+            model_verbosity: config_toml.model_verbosity,
+            tools: config_toml.tools.map(From::from),
+            profile: config_toml.profile,
+            profiles,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -593,6 +606,15 @@ impl HooksConfig {
                 timeout_ms: default_timeout,
                 ..Default::default()
             },
+        }
+    }
+}
+
+impl From<ToolsToml> for Tools {
+    fn from(tools_toml: ToolsToml) -> Self {
+        Self {
+            web_search: tools_toml.web_search,
+            view_image: tools_toml.view_image,
         }
     }
 }
@@ -821,7 +843,6 @@ pub struct ConfigOverrides {
     pub include_plan_tool: Option<bool>,
     pub include_apply_patch_tool: Option<bool>,
     pub include_view_image_tool: Option<bool>,
-    pub disable_response_storage: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
 }
@@ -849,7 +870,6 @@ impl Config {
             include_plan_tool,
             include_apply_patch_tool,
             include_view_image_tool,
-            disable_response_storage,
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
         } = overrides;
@@ -925,18 +945,23 @@ impl Config {
             .or(config_profile.model)
             .or(cfg.model)
             .unwrap_or_else(default_model);
-        let model_family = find_family_for_model(&model).unwrap_or_else(|| {
-            let supports_reasoning_summaries =
-                cfg.model_supports_reasoning_summaries.unwrap_or(false);
-            ModelFamily {
-                slug: model.clone(),
-                family: model.clone(),
-                needs_special_apply_patch_instructions: false,
-                supports_reasoning_summaries,
-                uses_local_shell_tool: false,
-                apply_patch_tool_type: None,
-            }
+
+        let mut model_family = find_family_for_model(&model).unwrap_or_else(|| ModelFamily {
+            slug: model.clone(),
+            family: model.clone(),
+            needs_special_apply_patch_instructions: false,
+            supports_reasoning_summaries: false,
+            reasoning_summary_format: ReasoningSummaryFormat::None,
+            uses_local_shell_tool: false,
+            apply_patch_tool_type: None,
         });
+
+        if let Some(supports_reasoning_summaries) = cfg.model_supports_reasoning_summaries {
+            model_family.supports_reasoning_summaries = supports_reasoning_summaries;
+        }
+        if let Some(model_reasoning_summary_format) = cfg.model_reasoning_summary_format {
+            model_family.reasoning_summary_format = model_reasoning_summary_format;
+        }
 
         let openai_model_info = get_model_info(&model_family);
         let model_context_window = cfg
@@ -979,11 +1004,6 @@ impl Config {
                 .unwrap_or_else(AskForApproval::default),
             sandbox_policy,
             shell_environment_policy,
-            disable_response_storage: config_profile
-                .disable_response_storage
-                .or(cfg.disable_response_storage)
-                .or(disable_response_storage)
-                .unwrap_or(false),
             notify: cfg.notify,
             user_instructions,
             base_instructions,
@@ -1027,9 +1047,6 @@ impl Config {
             include_view_image_tool,
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
             hooks: HooksConfig::from_toml(cfg.hooks.clone()),
-            use_experimental_reasoning_summary: cfg
-                .use_experimental_reasoning_summary
-                .unwrap_or(false),
         };
         Ok(config)
     }
@@ -1252,7 +1269,6 @@ exclude_slash_tmp = true
         let toml = r#"
 model = "o3"
 approval_policy = "untrusted"
-disable_response_storage = false
 
 # Can be used to determine which profile to use if not specified by
 # `ConfigOverrides`.
@@ -1282,7 +1298,14 @@ model_provider = "openai-chat-completions"
 model = "o3"
 model_provider = "openai"
 approval_policy = "on-failure"
-disable_response_storage = true
+
+[profiles.gpt5]
+model = "gpt-5"
+model_provider = "openai"
+approval_policy = "on-failure"
+model_reasoning_effort = "high"
+model_reasoning_summary = "detailed"
+model_verbosity = "high"
 "#;
 
         let cfg: ConfigToml = toml::from_str(toml).expect("TOML deserialization should succeed");
@@ -1372,7 +1395,6 @@ disable_response_storage = true
                 approval_policy: AskForApproval::Never,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 shell_environment_policy: ShellEnvironmentPolicy::default(),
-                disable_response_storage: false,
                 user_instructions: None,
                 notify: None,
                 cwd: fixture.cwd(),
@@ -1405,9 +1427,12 @@ disable_response_storage = true
                     post_tool_use: None,
                     user_prompt_submit: None,
                     stop: None,
+                    pre_tool_use_match: Default::default(),
+                    post_tool_use_match: Default::default(),
+                    pre_tool_use_rules: Default::default(),
+                    post_tool_use_rules: Default::default(),
                     timeout_ms: 10_000
                 },
-                use_experimental_reasoning_summary: false,
             },
             o3_profile_config
         );
@@ -1438,7 +1463,6 @@ disable_response_storage = true
             approval_policy: AskForApproval::UnlessTrusted,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             shell_environment_policy: ShellEnvironmentPolicy::default(),
-            disable_response_storage: false,
             user_instructions: None,
             notify: None,
             cwd: fixture.cwd(),
@@ -1471,9 +1495,12 @@ disable_response_storage = true
                 post_tool_use: None,
                 user_prompt_submit: None,
                 stop: None,
+                pre_tool_use_match: Default::default(),
+                post_tool_use_match: Default::default(),
+                pre_tool_use_rules: Default::default(),
+                post_tool_use_rules: Default::default(),
                 timeout_ms: 10_000,
             },
-            use_experimental_reasoning_summary: false,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -1519,7 +1546,6 @@ disable_response_storage = true
             approval_policy: AskForApproval::OnFailure,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             shell_environment_policy: ShellEnvironmentPolicy::default(),
-            disable_response_storage: true,
             user_instructions: None,
             notify: None,
             cwd: fixture.cwd(),
@@ -1552,12 +1578,73 @@ disable_response_storage = true
                 post_tool_use: None,
                 user_prompt_submit: None,
                 stop: None,
+                pre_tool_use_match: Default::default(),
+                post_tool_use_match: Default::default(),
+                pre_tool_use_rules: Default::default(),
+                post_tool_use_rules: Default::default(),
                 timeout_ms: 10_000,
             },
-            use_experimental_reasoning_summary: false,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
+        let fixture = create_test_fixture()?;
+
+        let gpt5_profile_overrides = ConfigOverrides {
+            config_profile: Some("gpt5".to_string()),
+            cwd: Some(fixture.cwd()),
+            ..Default::default()
+        };
+        let gpt5_profile_config = Config::load_from_base_config_with_overrides(
+            fixture.cfg.clone(),
+            gpt5_profile_overrides,
+            fixture.codex_home(),
+        )?;
+        let expected_gpt5_profile_config = Config {
+            model: "gpt-5".to_string(),
+            model_family: find_family_for_model("gpt-5").expect("known model slug"),
+            model_context_window: Some(272_000),
+            model_max_output_tokens: Some(128_000),
+            model_provider_id: "openai".to_string(),
+            model_provider: fixture.openai_provider.clone(),
+            approval_policy: AskForApproval::OnFailure,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            shell_environment_policy: ShellEnvironmentPolicy::default(),
+            user_instructions: None,
+            notify: None,
+            cwd: fixture.cwd(),
+            mcp_servers: HashMap::new(),
+            model_providers: fixture.model_provider_map.clone(),
+            project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
+            codex_home: fixture.codex_home(),
+            history: History::default(),
+            file_opener: UriBasedFileOpener::VsCode,
+            tui: Tui::default(),
+            codex_linux_sandbox_exe: None,
+            hide_agent_reasoning: false,
+            show_raw_agent_reasoning: false,
+            model_reasoning_effort: ReasoningEffort::High,
+            model_reasoning_summary: ReasoningSummary::Detailed,
+            model_verbosity: Some(Verbosity::High),
+            chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+            experimental_resume: None,
+            base_instructions: None,
+            include_plan_tool: false,
+            include_apply_patch_tool: false,
+            tools_web_search_request: false,
+            responses_originator_header: "codex_cli_rs".to_string(),
+            preferred_auth_method: AuthMode::ChatGPT,
+            use_experimental_streamable_shell_tool: false,
+            include_view_image_tool: true,
+            disable_paste_burst: false,
+        };
+
+        assert_eq!(expected_gpt5_profile_config, gpt5_profile_config);
 
         Ok(())
     }

@@ -189,8 +189,14 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
                 return CodexStatus::InitiateShutdown;
             }
-            EventMsg::TokenCount(token_usage) => {
-                ts_println!(self, "tokens used: {}", token_usage.blended_total());
+            EventMsg::TokenCount(ev) => {
+                if let Some(usage_info) = ev.info {
+                    ts_println!(
+                        self,
+                        "tokens used: {}",
+                        usage_info.total_token_usage.blended_total()
+                    );
+                }
             }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 if !self.answer_started {
@@ -515,6 +521,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     model,
                     history_log_id: _,
                     history_entry_count: _,
+                    initial_messages: _,
                 } = session_configured_event;
 
                 ts_println!(
@@ -551,6 +558,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             },
             EventMsg::ShutdownComplete => return CodexStatus::Shutdown,
             EventMsg::ConversationHistory(_) => {}
+            EventMsg::UserMessage(_) => {}
         }
         CodexStatus::Running
     }
