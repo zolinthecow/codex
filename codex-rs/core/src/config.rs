@@ -532,6 +532,14 @@ pub struct HooksConfig {
     pub post_tool_use: Option<Vec<String>>,
     pub user_prompt_submit: Option<Vec<String>>,
     pub stop: Option<Vec<String>>,
+    /// Optional matcher to restrict which tools trigger the pre hook.
+    pub pre_tool_use_match: HookToolMatcher,
+    /// Optional matcher to restrict which tools trigger the post hook.
+    pub post_tool_use_match: HookToolMatcher,
+    /// Expanded list of pre‑tool rules (each with its own matcher).
+    pub pre_tool_use_rules: Vec<HookRule>,
+    /// Expanded list of post‑tool rules (each with its own matcher).
+    pub post_tool_use_rules: Vec<HookRule>,
     pub timeout_ms: u64,
 }
 
@@ -544,14 +552,43 @@ impl HooksConfig {
                 post_tool_use,
                 user_prompt_submit,
                 stop,
+                pre_tool_use_match,
+                post_tool_use_match,
+                pre_tool_use_rules,
+                post_tool_use_rules,
                 timeout_ms,
-            }) => HooksConfig {
-                pre_tool_use,
-                post_tool_use,
-                user_prompt_submit,
-                stop,
-                timeout_ms: timeout_ms.unwrap_or(default_timeout),
-            },
+            }) => {
+                // Start with synthesized legacy rules (if provided)
+                let mut pre_rules = Vec::new();
+                if let Some(argv) = pre_tool_use.clone() {
+                    pre_rules.push(HookRule {
+                        argv,
+                        matcher: HookToolMatcher::from_toml(pre_tool_use_match.clone()),
+                    });
+                }
+                let mut post_rules = Vec::new();
+                if let Some(argv) = post_tool_use.clone() {
+                    post_rules.push(HookRule {
+                        argv,
+                        matcher: HookToolMatcher::from_toml(post_tool_use_match.clone()),
+                    });
+                }
+                // Append explicit rules from TOML
+                pre_rules.extend(HookRule::vec_from_toml(pre_tool_use_rules));
+                post_rules.extend(HookRule::vec_from_toml(post_tool_use_rules));
+
+                HooksConfig {
+                    pre_tool_use,
+                    post_tool_use,
+                    user_prompt_submit,
+                    stop,
+                    pre_tool_use_match: HookToolMatcher::from_toml(pre_tool_use_match),
+                    post_tool_use_match: HookToolMatcher::from_toml(post_tool_use_match),
+                    pre_tool_use_rules: pre_rules,
+                    post_tool_use_rules: post_rules,
+                    timeout_ms: timeout_ms.unwrap_or(default_timeout),
+                }
+            }
             None => HooksConfig {
                 timeout_ms: default_timeout,
                 ..Default::default()
@@ -570,9 +607,130 @@ pub struct HooksToml {
     pub user_prompt_submit: Option<Vec<String>>,
     #[serde(default)]
     pub stop: Option<Vec<String>>,
+    /// Optional matcher to restrict which tools trigger the pre hook.
+    #[serde(default)]
+    pub pre_tool_use_match: Option<HookToolMatchToml>,
+    /// Optional matcher to restrict which tools trigger the post hook.
+    #[serde(default)]
+    pub post_tool_use_match: Option<HookToolMatchToml>,
+    /// Multiple rules for pre‑tool hooks, each with its own argv and matcher.
+    #[serde(default)]
+    pub pre_tool_use_rules: Option<Vec<HookRuleToml>>, 
+    /// Multiple rules for post‑tool hooks, each with its own argv and matcher.
+    #[serde(default)]
+    pub post_tool_use_rules: Option<Vec<HookRuleToml>>, 
     /// Optional timeout for hooks in milliseconds (default 10s).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookToolMatchToml {
+    /// Glob-style patterns ("apply_patch", "shell", "mcp:*", "*").
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// Exclusion patterns applied after include match.
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HookToolMatcher {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl HookToolMatcher {
+    fn from_toml(t: Option<HookToolMatchToml>) -> Self {
+        match t {
+            Some(HookToolMatchToml { include, exclude }) => HookToolMatcher {
+                include: include.unwrap_or_default(),
+                exclude: exclude.unwrap_or_default(),
+            },
+            None => HookToolMatcher::default(),
+        }
+    }
+
+    pub fn should_run_for(&self, tool: &str) -> bool {
+        // If include is empty, default to include all tools unless excluded.
+        let included = if self.include.is_empty() {
+            true
+        } else {
+            self.include.iter().any(|p| wildcard_match(p, tool))
+        };
+        if !included {
+            return false;
+        }
+        // Exclude overrides include when it matches.
+        if self.exclude.iter().any(|p| wildcard_match(p, tool)) {
+            return false;
+        }
+        true
+    }
+}
+
+fn wildcard_match(pat: &str, text: &str) -> bool {
+    // Supports '*' wildcard only.
+    if pat == "*" {
+        return true;
+    }
+    // Two-pointer greedy backtracking algorithm for '*' wildcard.
+    let (p_bytes, t_bytes) = (pat.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_idx, mut match_idx) = (None::<usize>, 0usize);
+    while ti < t_bytes.len() {
+        if pi < p_bytes.len() && (p_bytes[pi] == b'?' || p_bytes[pi] == t_bytes[ti]) {
+            // '?' not used, but keep parity with typical wildcard; treat as literal match only.
+            pi += 1;
+            ti += 1;
+        } else if pi < p_bytes.len() && p_bytes[pi] == b'*' {
+            star_idx = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(si) = star_idx {
+            // Backtrack to last '*'
+            pi = si + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+    // Consume remaining '*' in pattern
+    while pi < p_bytes.len() && p_bytes[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p_bytes.len()
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HookRuleToml {
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRule {
+    pub argv: Vec<String>,
+    pub matcher: HookToolMatcher,
+}
+
+impl HookRule {
+    fn from_toml(t: HookRuleToml) -> Self {
+        HookRule {
+            argv: t.argv,
+            matcher: HookToolMatcher {
+                include: t.include.unwrap_or_default(),
+                exclude: t.exclude.unwrap_or_default(),
+            },
+        }
+    }
+    fn vec_from_toml(v: Option<Vec<HookRuleToml>>) -> Vec<Self> {
+        v.unwrap_or_default().into_iter().map(Self::from_toml).collect()
+    }
 }
 
 impl ConfigToml {

@@ -497,6 +497,32 @@ user_prompt_submit = ["/usr/local/bin/my-prompt-hook"]
 stop = ["/usr/local/bin/my-stop-hook"]
 # Optional timeout (ms); defaults to 10000
 timeout_ms = 10000
+
+# Optionally, restrict which tools trigger pre/post hooks using simple glob patterns.
+# Tool ids look like: "shell", "apply_patch", "update_plan", "exec_command", "write_stdin", or "mcp:<server>.<tool>".
+[hooks.pre_tool_use_match]
+include = ["apply_patch", "write_stdin", "mcp:*"]   # empty means include all
+exclude = ["shell"]                                  # checked after include
+
+[hooks.post_tool_use_match]
+include = ["apply_patch", "write_stdin", "mcp:*"]
+exclude = ["shell"]
+
+# Alternatively, specify multiple rules with per-rule argv + matchers.
+[[hooks.pre_tool_use_rules]]
+argv = ["/usr/local/bin/my-write-pre-hook"]
+include = ["apply_patch", "write_stdin"]
+exclude = []
+
+[[hooks.pre_tool_use_rules]]
+argv = ["/usr/local/bin/my-read-pre-hook"]
+include = ["shell", "mcp:*"]
+exclude = []
+
+[[hooks.post_tool_use_rules]]
+argv = ["/usr/local/bin/my-write-post-hook"]
+include = ["apply_patch", "write_stdin"]
+exclude = []
 ```
 
 Payloads:
@@ -511,6 +537,7 @@ Semantics:
 - PostToolUse: non‑zero exit is logged to the UI but does not alter the tool result.
 - UserPromptSubmit: non‑zero exit is logged; the prompt proceeds.
 - Stop: runs at the end of each turn; non‑zero/timeout is logged and processing proceeds.
+ - Pre/Post tool filters: when `include` is empty, the hook applies to all tools; any matching `exclude` prevents the hook from running.
 
 Stop hook output contract:
 - The stop hook may print a single JSON object to stdout to influence turn completion:

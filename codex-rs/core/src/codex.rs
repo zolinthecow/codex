@@ -1013,6 +1013,9 @@ impl Session {
         cwd: &Path,
         arguments: serde_json::Value,
     ) -> Result<(), String> {
+        if !self.hooks.pre_tool_use_match.should_run_for(tool) {
+            return Ok(());
+        }
         let payload = serde_json::json!({
             "type": "pre-tool-use",
             "sub_id": sub_id,
@@ -1021,8 +1024,17 @@ impl Session {
             "cwd": cwd.to_string_lossy(),
             "arguments": arguments,
         });
-        self.maybe_run_hook_json(&self.hooks.pre_tool_use, payload)
-            .await
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| format!("failed to serialize hook payload: {e}"))?;
+        // Run all matching rules; first failure aborts the tool.
+        for rule in &self.hooks.pre_tool_use_rules {
+            if rule.matcher.should_run_for(tool)
+                && let Err(e) = self.run_hook_argv(&rule.argv, &json).await
+            {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     pub async fn run_post_tool_hook(
@@ -1034,6 +1046,9 @@ impl Session {
         success: Option<bool>,
         output: Option<&str>,
     ) {
+        if !self.hooks.post_tool_use_match.should_run_for(tool) {
+            return;
+        }
         let limited = output.map(|s| s.chars().take(4096).collect::<String>());
         let payload = serde_json::json!({
             "type": "post-tool-use",
@@ -1044,12 +1059,21 @@ impl Session {
             "success": success,
             "output": limited,
         });
-        if let Err(e) = self
-            .maybe_run_hook_json(&self.hooks.post_tool_use, payload)
-            .await
-        {
-            self.send_error_event(sub_id, format!("post_tool_use hook failed: {e}"))
-                .await;
+        let json = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                self.send_error_event(sub_id, format!("failed to serialize hook payload: {e}"))
+                    .await;
+                return;
+            }
+        };
+        for rule in &self.hooks.post_tool_use_rules {
+            if rule.matcher.should_run_for(tool)
+                && let Err(e) = self.run_hook_argv(&rule.argv, &json).await
+            {
+                self.send_error_event(sub_id, format!("post_tool_use hook failed: {e}"))
+                    .await;
+            }
         }
     }
 
