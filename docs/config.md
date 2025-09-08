@@ -527,7 +527,55 @@ Semantics:
 - PostToolUse: non‑zero exit is logged to the UI but does not alter the tool result.
 - UserPromptSubmit: non‑zero exit is logged; the prompt proceeds.
 - Stop: runs at the end of each turn; non‑zero/timeout is logged and processing proceeds.
- - Pre/Post tool filters: when `include` is empty, the hook applies to all tools; any matching `exclude` prevents the hook from running.
+- Pre/Post tool filters: when `include` is empty, the hook applies to all tools; any matching `exclude` prevents the hook from running.
+
+Hook Payloads (stable)
+- PreToolUse:
+  - Fields: `type`, `tool`, `sub_id`, `call_id`, `cwd`, `git_root`, `arguments`, `targets` (optional)
+  - `targets` is populated for write tools when known:
+    - `apply_patch`: absolute paths derived from patch headers
+    - `shell rm`: absolute paths after simple glob expansion (final `*` segment)
+    - `write_stdin`: omitted (no file sink)
+  - For `shell`, `arguments` includes both `command` (joined string) and `argv` (array), plus `workdir` and `timeout_ms`.
+- PostToolUse:
+  - Fields: `type`, `tool`, `sub_id`, `call_id`, `cwd`, `git_root`, `success`, `output`, `arguments`, `edited`, `deleted`, `created`, `renamed`
+  - `apply_patch`: `edited/deleted/created/renamed` populated from ApplyPatchAction changes
+  - `shell rm`: `deleted` populated from expanded rm targets on success
+  - `write_stdin`: file lists omitted
+- UserPromptSubmit:
+  - Fields: `type`, `sub_id`, `cwd`, `git_root`, `texts`, `images`
+
+Matching and rules
+- Top‑level `pre_tool_use`/`post_tool_use` + `*_match` provide a simple single rule.
+- `[[hooks.pre_tool_use_rules]]`/`[[hooks.post_tool_use_rules]]` allow multiple rules with per‑rule matchers.
+- When rules are present, prefer them over top‑level arrays to avoid duplicate firings.
+
+Common tool usage (for hook authors)
+- "shell" (aka `container.exec` / local shell): executes shell commands.
+  - Typical use: build/test commands, file system ops, package installers.
+  - Hooks: pre/post include `arguments.command` (joined string) and `arguments.argv` (array).
+  - Special‑case behavior: for `rm`/`git rm`, Codex expands simple globs (final `*` segment) and passes absolute `targets` in Pre; Post marks those `deleted` on success.
+- "apply_patch": applies a unified diff to create/modify/move/delete files deterministically.
+  - Typical use: all file edits Codex proposes for code/content changes.
+  - Hooks: Pre includes `targets` from patch headers; Post includes exact `edited`, `deleted`, `created`, `renamed` sets (no git scanning needed).
+- "write_stdin": writes bytes to the stdin of a running exec session.
+  - Typical use: interact with a live process (answer prompts, feed REPL/compiler input).
+  - Hooks: no file `targets`/effects by default (not a path‑based write). Use for auditing/telemetry rather than file tracking.
+- "exec_command": Responses API variant of shell execution.
+  - Typical use: same as "shell"; parameters may include `cmd`, `shell`, `login`, `yield_time_ms`.
+  - Hooks: treat equivalently to "shell" for filtering and logging.
+- "update_plan": model planning/status updates (no file writes).
+  - Typical use: allow model to maintain/communicate a plan; no side effects on disk.
+  - Hooks: suitable for telemetry; skip in write‑only filters.
+- "mcp:<server>.<tool>": tool provided by an external MCP server.
+  - Typical use: domain‑specific actions (e.g., search, repo APIs). File effects are server‑dependent.
+  - Hooks: arguments are forwarded; Codex cannot infer file `targets`/effects unless the server reports them.
+- "view_image": attaches a local image path to context (no writes).
+  - Typical use: allow the agent to “see” a local image; no file edits implied.
+
+Notes
+- cwd and git_root are included in all Pre/Post/UserPromptSubmit payloads to simplify path resolution and repo‑relative logging.
+- Pre/Post are called once per tool call. When using rule blocks (`[[hooks.*_rules]]`), avoid also setting top‑level `pre_tool_use`/`post_tool_use` to prevent duplicate firings.
 
 Stop hook output contract:
 - The stop hook may print a single JSON object to stdout to influence turn completion:

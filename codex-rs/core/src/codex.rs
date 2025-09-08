@@ -988,6 +988,43 @@ impl Session {
         }
     }
 
+    async fn run_hook_argv_with_env(
+        &self,
+        argv: &[String],
+        json_arg: &str,
+        extra_env: &[(&str, String)],
+    ) -> Result<(), String> {
+        if argv.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        if argv.len() > 1 {
+            cmd.args(&argv[1..]);
+        }
+        cmd.arg(json_arg);
+        for (k, v) in extra_env.iter() {
+            cmd.env(k, v);
+        }
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let timeout_dur = std::time::Duration::from_millis(self.hooks.timeout_ms);
+        match tokio::time::timeout(timeout_dur, cmd.output()).await {
+            Err(_) => Err(format!("hook timed out after {} ms", self.hooks.timeout_ms)),
+            Ok(Err(e)) => Err(format!("failed to spawn hook: {e}")),
+            Ok(Ok(output)) => {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    let code = output.status.code().unwrap_or(-1);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let snippet: String = stderr.chars().take(512).collect();
+                    Err(format!("hook exited with code {code}: {snippet}"))
+                }
+            }
+        }
+    }
+
     async fn maybe_run_hook_json(
         &self,
         argv: &Option<Vec<String>>,
@@ -1003,7 +1040,7 @@ impl Session {
         }
     }
 
-    pub async fn run_user_prompt_submit_hook(&self, sub_id: &str, items: &[InputItem]) {
+    pub async fn run_user_prompt_submit_hook(&self, sub_id: &str, items: &[InputItem], cwd: &std::path::Path) {
         let mut texts = Vec::new();
         let mut images = Vec::new();
         for it in items {
@@ -1014,9 +1051,12 @@ impl Session {
                 _ => (),
             }
         }
+        let git_root = find_git_root_for(cwd).unwrap_or_else(|| cwd.to_path_buf());
         let payload = serde_json::json!({
             "type": "user-prompt-submit",
             "sub_id": sub_id,
+            "cwd": cwd.to_string_lossy(),
+            "git_root": git_root.to_string_lossy(),
             "texts": texts,
             "images": images,
         });
@@ -1036,24 +1076,41 @@ impl Session {
         tool: &str,
         cwd: &Path,
         arguments: serde_json::Value,
+        targets: Option<Vec<std::path::PathBuf>>,
     ) -> Result<(), String> {
         if !self.hooks.pre_tool_use_match.should_run_for(tool) {
             return Ok(());
         }
+        let git_root = find_git_root_for(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        let target_list = targets.map(|v| {
+            v.into_iter()
+                .map(|p| p.canonicalize().unwrap_or(p).to_string_lossy().to_string())
+                .collect::<Vec<String>>()
+        });
         let payload = serde_json::json!({
             "type": "pre-tool-use",
             "sub_id": sub_id,
             "call_id": call_id,
             "tool": tool,
             "cwd": cwd.to_string_lossy(),
+            "git_root": git_root.to_string_lossy(),
+            "targets": target_list,
             "arguments": arguments,
         });
         let json = serde_json::to_string(&payload)
             .map_err(|e| format!("failed to serialize hook payload: {e}"))?;
-        // Run all matching rules; first failure aborts the tool.
         for rule in &self.hooks.pre_tool_use_rules {
             if rule.matcher.should_run_for(tool)
-                && let Err(e) = self.run_hook_argv(&rule.argv, &json).await
+                && let Err(e) = self
+                    .run_hook_argv_with_env(
+                        &rule.argv,
+                        &json,
+                        &[("TOOL_ID", tool.to_string()),
+                          ("SUB_ID", sub_id.to_string()),
+                          ("CALL_ID", call_id.to_string()),
+                          ("GIT_ROOT", git_root.to_string_lossy().to_string())],
+                    )
+                    .await
             {
                 return Err(e);
             }
@@ -1061,6 +1118,7 @@ impl Session {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_post_tool_hook(
         &self,
         sub_id: &str,
@@ -1069,19 +1127,37 @@ impl Session {
         cwd: &Path,
         success: Option<bool>,
         output: Option<&str>,
+        arguments: serde_json::Value,
+        edited: Option<Vec<std::path::PathBuf>>,
+        deleted: Option<Vec<std::path::PathBuf>>,
+        created: Option<Vec<std::path::PathBuf>>,
+        renamed: Option<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
     ) {
         if !self.hooks.post_tool_use_match.should_run_for(tool) {
             return;
         }
+        let git_root = find_git_root_for(cwd).unwrap_or_else(|| cwd.to_path_buf());
         let limited = output.map(|s| s.chars().take(4096).collect::<String>());
+        let map_paths = |v: Option<Vec<std::path::PathBuf>>| -> Option<Vec<String>> {
+            v.map(|vv| vv.into_iter().map(|p| p.canonicalize().unwrap_or(p).to_string_lossy().to_string()).collect())
+        };
+        let map_ren = |v: Option<Vec<(std::path::PathBuf,std::path::PathBuf)>>| -> Option<Vec<serde_json::Value>> {
+            v.map(|vv| vv.into_iter().map(|(a,b)| serde_json::json!({"from": a.canonicalize().unwrap_or(a).to_string_lossy(), "to": b.canonicalize().unwrap_or(b).to_string_lossy()})).collect())
+        };
         let payload = serde_json::json!({
             "type": "post-tool-use",
             "sub_id": sub_id,
             "call_id": call_id,
             "tool": tool,
             "cwd": cwd.to_string_lossy(),
+            "git_root": git_root.to_string_lossy(),
             "success": success,
             "output": limited,
+            "arguments": arguments,
+            "edited": map_paths(edited),
+            "deleted": map_paths(deleted),
+            "created": map_paths(created),
+            "renamed": map_ren(renamed),
         });
         let json = match serde_json::to_string(&payload) {
             Ok(s) => s,
@@ -1093,7 +1169,16 @@ impl Session {
         };
         for rule in &self.hooks.post_tool_use_rules {
             if rule.matcher.should_run_for(tool)
-                && let Err(e) = self.run_hook_argv(&rule.argv, &json).await
+                && let Err(e) = self
+                    .run_hook_argv_with_env(
+                        &rule.argv,
+                        &json,
+                        &[("TOOL_ID", tool.to_string()),
+                          ("SUB_ID", sub_id.to_string()),
+                          ("CALL_ID", call_id.to_string()),
+                          ("GIT_ROOT", git_root.to_string_lossy().to_string())],
+                    )
+                    .await
             {
                 self.send_error_event(sub_id, format!("post_tool_use hook failed: {e}"))
                     .await;
@@ -1209,6 +1294,168 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.interrupt_task();
     }
+}
+
+fn find_git_root_for(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = if start.is_dir() {
+        start.to_path_buf()
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    loop {
+        let marker = cur.join(".git");
+        if marker.is_dir() || marker.is_file() {
+            return Some(cur);
+        }
+        if let Some(parent) = cur.parent() {
+            cur = parent.to_path_buf();
+        } else {
+            return None;
+        }
+    }
+}
+
+fn extract_targets_from_patch(patch: &str, cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut set = std::collections::BTreeSet::<std::path::PathBuf>::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            // diff --git a/foo b/bar
+            let mut parts = rest.splitn(2, " b/");
+            let _a = parts.next();
+            let b = parts.next();
+            if let Some(b) = b {
+                let p = cwd.join(b);
+                set.insert(p);
+            }
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            let p = cwd.join(path);
+            set.insert(p);
+        } else if let Some(path) = line.strip_prefix("--- a/") {
+            let p = cwd.join(path);
+            set.insert(p);
+        } else if let Some(path) = line.strip_prefix("rename to ") {
+            let p = cwd.join(path);
+            set.insert(p);
+        } else if let Some(path) = line.strip_prefix("rename from ") {
+            let p = cwd.join(path);
+            set.insert(p);
+        }
+    }
+    set.into_iter().collect()
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_patch_effects(
+    patch: &str,
+    cwd: &std::path::Path,
+) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>, Vec<std::path::PathBuf>, Vec<(std::path::PathBuf, std::path::PathBuf)>) {
+    let mut edited = std::collections::BTreeSet::<std::path::PathBuf>::new();
+    let mut deleted = std::collections::BTreeSet::<std::path::PathBuf>::new();
+    let mut created = std::collections::BTreeSet::<std::path::PathBuf>::new();
+    let mut renamed = Vec::<(std::path::PathBuf, std::path::PathBuf)>::new();
+    let mut cur_a: Option<String> = None;
+    let mut cur_b: Option<String> = None;
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            let mut parts = rest.splitn(2, " b/");
+            cur_a = parts.next().map(|s| s.to_string());
+            cur_b = parts.next().map(|s| s.to_string());
+        } else if line.starts_with("new file mode ") {
+            if let Some(b) = &cur_b {
+                created.insert(cwd.join(b));
+            }
+        } else if line.starts_with("deleted file mode ") {
+            if let Some(a) = &cur_a {
+                deleted.insert(cwd.join(a));
+            }
+        } else if let Some(_from) = line.strip_prefix("rename from ") {
+            // handled when we see the subsequent "rename to" line
+        } else if let Some(to) = line.strip_prefix("rename to ") {
+            if let Some(from) = &cur_a {
+                renamed.push((cwd.join(from), cwd.join(to)));
+            }
+        } else if line.starts_with("@@ ") && let Some(b) = &cur_b {
+            edited.insert(cwd.join(b));
+        }
+    }
+    // Remove overlaps: if a file is created or deleted or renamed, don't list it as edited.
+    for p in created.iter() {
+        edited.remove(p);
+    }
+    for p in deleted.iter() {
+        edited.remove(p);
+    }
+    for (from, to) in &renamed {
+        edited.remove(from);
+        edited.remove(to);
+    }
+    (
+        edited.into_iter().collect(),
+        deleted.into_iter().collect(),
+        created.into_iter().collect(),
+        renamed,
+    )
+}
+
+fn is_rm_command(argv: &[String]) -> bool {
+    if argv.is_empty() { return false; }
+    if argv[0] == "rm" { return true; }
+    if argv[0] == "git" && argv.get(1).map(|s| s.as_str()) == Some("rm") { return true; }
+    false
+}
+
+fn star_match(pat: &str, text: &str) -> bool {
+    if pat == "*" { return true; }
+    let (p, t) = (pat.as_bytes(), text.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while j < t.len() {
+        if i < p.len() && (p[i] == t[j]) {
+            i += 1; j += 1;
+        } else if i < p.len() && p[i] == b'*' {
+            star = Some(i);
+            mark = j;
+            i += 1;
+        } else if let Some(si) = star {
+            i = si + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    while i < p.len() && p[i] == b'*' { i += 1; }
+    i == p.len()
+}
+
+fn expand_rm_targets_for_pre(argv: &[String], cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if !is_rm_command(argv) { return Vec::new(); }
+    let mut patterns: Vec<String> = Vec::new();
+    let mut it = argv.iter();
+    let first = it.next().cloned();
+    if first.as_deref() == Some("git") { it.next(); } // skip 'rm'
+    for arg in it {
+        if arg.starts_with('-') { continue; }
+        patterns.push(arg.clone());
+    }
+    let mut out = Vec::new();
+    for pat in patterns {
+        let path = cwd.join(&pat);
+        let parent = path.parent().unwrap_or(cwd);
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.contains('*') {
+            if let Ok(rd) = std::fs::read_dir(parent) {
+                for e in rd.flatten() {
+                    if let Some(fname) = e.file_name().to_str() && star_match(name, fname) {
+                        out.push(parent.join(fname));
+                    }
+                }
+            }
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -1395,7 +1642,7 @@ async fn submission_loop(
             }
             Op::UserInput { items } => {
                 // Synchronous hook for user prompt submission; errors are logged.
-                sess.run_user_prompt_submit_hook(&sub.id, &items).await;
+                sess.run_user_prompt_submit_hook(&sub.id, &items, &turn_context.cwd).await;
                 // attempt to inject input into current task
                 if let Err(items) = sess.inject_input(items) {
                     // no current task, spawn a new one
@@ -1414,7 +1661,7 @@ async fn submission_loop(
                 summary,
             } => {
                 // Synchronous hook for user prompt submission; errors are logged.
-                sess.run_user_prompt_submit_hook(&sub.id, &items).await;
+                sess.run_user_prompt_submit_hook(&sub.id, &items, &turn_context.cwd).await;
                 // attempt to inject input into current task
                 if let Err(items) = sess.inject_input(items) {
                     // Derive a fresh TurnContext for this turn using the provided overrides.
@@ -2271,8 +2518,11 @@ async fn handle_response_item(
 
             let exec_params = to_exec_params(params, turn_context);
             // Pre‑tool hook for LocalShellCall
+            let argv = exec_params.command.clone();
+            let joined = argv.join(" ");
             let hook_args = serde_json::json!({
-                "command": exec_params.command,
+                "command": joined,
+                "argv": argv,
                 "workdir": exec_params.cwd,
                 "timeout_ms": exec_params.timeout_ms,
             });
@@ -2283,6 +2533,7 @@ async fn handle_response_item(
                     "shell",
                     &turn_context.cwd,
                     hook_args,
+                    None,
                 )
                 .await
             {
@@ -2296,7 +2547,7 @@ async fn handle_response_item(
             }
 
             let resp = handle_container_exec_with_params(
-                exec_params,
+                exec_params.clone(),
                 sess,
                 turn_context,
                 turn_diff_tracker,
@@ -2321,6 +2572,16 @@ async fn handle_response_item(
                 &turn_context.cwd,
                 success,
                 output_str,
+                serde_json::json!({
+                    "command": joined,
+                    "argv": exec_params.command,
+                    "workdir": exec_params.cwd,
+                    "timeout_ms": exec_params.timeout_ms,
+                }),
+                None,
+                None,
+                None,
+                None,
             )
             .await;
             Some(resp)
@@ -2388,10 +2649,25 @@ async fn handle_function_call(
                     }
                 };
             // Pre‑tool hook: fail the tool if hook exits non‑zero.
-            let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
-                .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+            // Build explicit arguments with both argv and command string for logging.
+            let argv = params.command.clone();
+            let joined = argv.join(" ");
+            let hook_args = serde_json::json!({
+                "command": joined,
+                "argv": argv,
+                "workdir": params.cwd,
+                "timeout_ms": params.timeout_ms,
+            });
+            let rm_targets = expand_rm_targets_for_pre(&params.command, &turn_context.cwd);
             if let Err(e) = sess
-                .run_pre_tool_hook(&sub_id, &call_id, "shell", &turn_context.cwd, arg_json)
+                .run_pre_tool_hook(
+                    &sub_id,
+                    &call_id,
+                    "shell",
+                    &turn_context.cwd,
+                    hook_args,
+                    if rm_targets.is_empty() { None } else { Some(rm_targets) },
+                )
                 .await
             {
                 return ResponseInputItem::FunctionCallOutput {
@@ -2404,7 +2680,7 @@ async fn handle_function_call(
             }
 
             let resp = handle_container_exec_with_params(
-                params,
+                params.clone(),
                 sess,
                 turn_context,
                 turn_diff_tracker,
@@ -2423,6 +2699,16 @@ async fn handle_function_call(
                 }
                 _ => (None, None),
             };
+            let rm_deleted = if success == Some(true) {
+                let t = expand_rm_targets_for_pre(&params.command, &turn_context.cwd);
+                if t.is_empty() { None } else { Some(t) }
+            } else { None };
+            let post_args = serde_json::json!({
+                "command": params.command.clone().join(" "),
+                "argv": params.command,
+                "workdir": params.cwd,
+                "timeout_ms": params.timeout_ms,
+            });
             sess.run_post_tool_hook(
                 &sub_id,
                 match &resp {
@@ -2434,6 +2720,11 @@ async fn handle_function_call(
                 &turn_context.cwd,
                 success,
                 output_str,
+                post_args,
+                None,
+                rm_deleted,
+                None,
+                None,
             )
             .await;
 
@@ -2485,13 +2776,16 @@ async fn handle_function_call(
             // Pre‑tool hook
             let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
                 .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
+            // Derive targets from patch body for apply_patch
+            let pre_targets = extract_targets_from_patch(&args.input, &turn_context.cwd);
             if let Err(e) = sess
                 .run_pre_tool_hook(
                     &sub_id,
                     &call_id,
                     "apply_patch",
                     &turn_context.cwd,
-                    arg_json,
+                    arg_json.clone(),
+                    if pre_targets.is_empty() { None } else { Some(pre_targets) },
                 )
                 .await
             {
@@ -2530,6 +2824,11 @@ async fn handle_function_call(
                 }
                 _ => (None, None),
             };
+            let (edited, deleted, created, renamed) = if success == Some(true) {
+                parse_patch_effects(&args.input, &turn_context.cwd)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
             sess.run_post_tool_hook(
                 &sub_id,
                 match &resp {
@@ -2541,6 +2840,11 @@ async fn handle_function_call(
                 &turn_context.cwd,
                 success,
                 output_str,
+                arg_json.clone(),
+                if edited.is_empty() { None } else { Some(edited) },
+                if deleted.is_empty() { None } else { Some(deleted) },
+                if created.is_empty() { None } else { Some(created) },
+                if renamed.is_empty() { None } else { Some(renamed) },
             )
             .await;
 
@@ -2555,7 +2859,8 @@ async fn handle_function_call(
                     &call_id,
                     "update_plan",
                     &turn_context.cwd,
-                    arg_json,
+                    arg_json.clone(),
+                    None,
                 )
                 .await
             {
@@ -2584,6 +2889,11 @@ async fn handle_function_call(
                 &turn_context.cwd,
                 success,
                 output_str,
+                arg_json,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
             resp
@@ -2611,7 +2921,8 @@ async fn handle_function_call(
                     &call_id,
                     EXEC_COMMAND_TOOL_NAME,
                     &turn_context.cwd,
-                    arg_json,
+                    arg_json.clone(),
+                    None,
                 )
                 .await
             {
@@ -2646,6 +2957,11 @@ async fn handle_function_call(
                 &turn_context.cwd,
                 success,
                 output_str,
+                arg_json,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
             resp
@@ -2672,7 +2988,8 @@ async fn handle_function_call(
                     &call_id,
                     WRITE_STDIN_TOOL_NAME,
                     &turn_context.cwd,
-                    arg_json,
+                    arg_json.clone(),
+                    None,
                 )
                 .await
             {
@@ -2708,6 +3025,11 @@ async fn handle_function_call(
                 &turn_context.cwd,
                 success,
                 output_str,
+                arg_json,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
             resp
@@ -2722,7 +3044,7 @@ async fn handle_function_call(
                     let arg_json = serde_json::from_str::<serde_json::Value>(&arguments)
                         .unwrap_or_else(|_| serde_json::json!({ "raw": arguments }));
                     if let Err(e) = sess
-                        .run_pre_tool_hook(&sub_id, &call_id, &tool_id, &turn_context.cwd, arg_json)
+                        .run_pre_tool_hook(&sub_id, &call_id, &tool_id, &turn_context.cwd, arg_json, None)
                         .await
                     {
                         return ResponseInputItem::FunctionCallOutput {
@@ -2759,6 +3081,11 @@ async fn handle_function_call(
                         &turn_context.cwd,
                         success,
                         output_str,
+                        serde_json::json!({}),
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await;
                     resp
@@ -2807,6 +3134,7 @@ async fn handle_custom_tool_call(
                     "apply_patch",
                     &turn_context.cwd,
                     hook_args,
+                    None,
                 )
                 .await
             {
@@ -2839,6 +3167,11 @@ async fn handle_custom_tool_call(
                         &turn_context.cwd,
                         output.success,
                         Some(&out_str),
+                        serde_json::json!({}),
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await;
                     ResponseInputItem::CustomToolCallOutput {
@@ -3876,6 +4209,7 @@ mod tests {
             &[InputItem::Text {
                 text: "hello".to_string(),
             }],
+            std::path::Path::new("."),
         )
         .await;
 
