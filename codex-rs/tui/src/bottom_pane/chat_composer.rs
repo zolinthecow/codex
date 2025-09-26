@@ -142,14 +142,16 @@ impl ChatComposer {
             .desired_height(width.saturating_sub(LIVE_PREFIX_COLS))
             + match &self.active_popup {
                 ActivePopup::None => FOOTER_HEIGHT_WITH_HINT,
-                ActivePopup::Command(c) => c.calculate_required_height(),
+                ActivePopup::Command(c) => c.calculate_required_height(width),
                 ActivePopup::File(c) => c.calculate_required_height(),
             }
     }
 
     pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         let popup_constraint = match &self.active_popup {
-            ActivePopup::Command(popup) => Constraint::Max(popup.calculate_required_height()),
+            ActivePopup::Command(popup) => {
+                Constraint::Max(popup.calculate_required_height(area.width))
+            }
             ActivePopup::File(popup) => Constraint::Max(popup.calculate_required_height()),
             ActivePopup::None => Constraint::Max(FOOTER_HEIGHT_WITH_HINT),
         };
@@ -159,8 +161,8 @@ impl ChatComposer {
         // Leave 1 for border and 1 for padding
         textarea_rect.width = textarea_rect.width.saturating_sub(LIVE_PREFIX_COLS);
         textarea_rect.x = textarea_rect.x.saturating_add(LIVE_PREFIX_COLS);
-        let state = self.textarea_state.borrow();
-        self.textarea.cursor_pos_with_state(textarea_rect, &state)
+        let state = *self.textarea_state.borrow();
+        self.textarea.cursor_pos_with_state(textarea_rect, state)
     }
 
     /// Returns true if the composer currently contains no user input.
@@ -262,7 +264,6 @@ impl ChatComposer {
     }
 
     /// Get the current composer text.
-    #[cfg(test)]
     pub(crate) fn current_text(&self) -> String {
         self.textarea.text().to_string()
     }
@@ -419,7 +420,7 @@ impl ChatComposer {
                     // Capture any needed data from popup before clearing it.
                     let prompt_content = match sel {
                         CommandItem::UserPrompt(idx) => {
-                            popup.prompt_content(idx).map(|s| s.to_string())
+                            popup.prompt_content(idx).map(str::to_string)
                         }
                         _ => None,
                     };
@@ -548,7 +549,7 @@ impl ChatComposer {
                         let format_label = match Path::new(&sel_path)
                             .extension()
                             .and_then(|e| e.to_str())
-                            .map(|s| s.to_ascii_lowercase())
+                            .map(str::to_ascii_lowercase)
                         {
                             Some(ext) if ext == "png" => "PNG",
                             Some(ext) if ext == "jpg" || ext == "jpeg" => "JPEG",
@@ -615,7 +616,7 @@ impl ChatComposer {
             text[safe_cursor..]
                 .chars()
                 .next()
-                .map(|c| c.is_whitespace())
+                .map(char::is_whitespace)
                 .unwrap_or(false)
         } else {
             false
@@ -643,7 +644,7 @@ impl ChatComposer {
         let ws_len_right: usize = after_cursor
             .chars()
             .take_while(|c| c.is_whitespace())
-            .map(|c| c.len_utf8())
+            .map(char::len_utf8)
             .sum();
         let start_right = safe_cursor + ws_len_right;
         let end_right_rel = text[start_right..]
@@ -1232,7 +1233,10 @@ impl ChatComposer {
 impl WidgetRef for ChatComposer {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let (popup_constraint, hint_spacing) = match &self.active_popup {
-            ActivePopup::Command(popup) => (Constraint::Max(popup.calculate_required_height()), 0),
+            ActivePopup::Command(popup) => (
+                Constraint::Max(popup.calculate_required_height(area.width)),
+                0,
+            ),
             ActivePopup::File(popup) => (Constraint::Max(popup.calculate_required_height()), 0),
             ActivePopup::None => (
                 Constraint::Length(FOOTER_HEIGHT_WITH_HINT),

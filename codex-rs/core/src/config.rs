@@ -1,6 +1,7 @@
 use crate::config_profile::ConfigProfile;
 use crate::config_types::History;
 use crate::config_types::McpServerConfig;
+use crate::config_types::Notifications;
 use crate::config_types::ReasoningSummaryFormat;
 use crate::config_types::SandboxWorkspaceWrite;
 use crate::config_types::ShellEnvironmentPolicy;
@@ -36,8 +37,8 @@ use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
 use toml_edit::Table as TomlTable;
 
-const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
-const OPENAI_DEFAULT_REVIEW_MODEL: &str = "gpt-5";
+const OPENAI_DEFAULT_MODEL: &str = "gpt-5-codex";
+const OPENAI_DEFAULT_REVIEW_MODEL: &str = "gpt-5-codex";
 pub const GPT_5_CODEX_MEDIUM_MODEL: &str = "gpt-5-codex";
 
 /// Maximum number of bytes of the documentation that will be embedded. Larger
@@ -53,7 +54,7 @@ pub struct Config {
     /// Optional override of model selection.
     pub model: String,
 
-    /// Model used specifically for review sessions. Defaults to "gpt-5".
+    /// Model used specifically for review sessions. Defaults to "gpt-5-codex".
     pub review_model: String,
 
     pub model_family: ModelFamily,
@@ -116,6 +117,10 @@ pub struct Config {
     ///
     /// If unset the feature is disabled.
     pub notify: Option<Vec<String>>,
+
+    /// TUI notifications preference. When set, the TUI will send OSC 9 notifications on approvals
+    /// and turn completions when not focused.
+    pub tui_notifications: Notifications,
 
     /// The directory that should be treated as the current working directory
     /// for the session. All relative paths inside the business-logic layer are
@@ -331,14 +336,12 @@ pub fn write_global_mcp_servers(
                 entry["env"] = TomlItem::Table(env_table);
             }
 
-            if let Some(timeout) = config.startup_timeout_ms {
-                let timeout = i64::try_from(timeout).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "startup_timeout_ms exceeds supported range",
-                    )
-                })?;
-                entry["startup_timeout_ms"] = toml_edit::value(timeout);
+            if let Some(timeout) = config.startup_timeout_sec {
+                entry["startup_timeout_sec"] = toml_edit::value(timeout.as_secs_f64());
+            }
+
+            if let Some(timeout) = config.tool_timeout_sec {
+                entry["tool_timeout_sec"] = toml_edit::value(timeout.as_secs_f64());
             }
 
             doc["mcp_servers"][name.as_str()] = TomlItem::Table(entry);
@@ -704,7 +707,7 @@ pub struct ConfigToml {
     /// or placeholder replacement will occur for fast keypress bursts.
     pub disable_paste_burst: Option<bool>,
 
-    /// Optional hooks configuration.
+    /// Synchronous hooks configuration.
     pub hooks: Option<HooksToml>,
 }
 
@@ -752,13 +755,9 @@ pub struct HooksConfig {
     pub post_tool_use: Option<Vec<String>>,
     pub user_prompt_submit: Option<Vec<String>>,
     pub stop: Option<Vec<String>>,
-    /// Optional matcher to restrict which tools trigger the pre hook.
     pub pre_tool_use_match: HookToolMatcher,
-    /// Optional matcher to restrict which tools trigger the post hook.
     pub post_tool_use_match: HookToolMatcher,
-    /// Expanded list of pre‑tool rules (each with its own matcher).
     pub pre_tool_use_rules: Vec<HookRule>,
-    /// Expanded list of post‑tool rules (each with its own matcher).
     pub post_tool_use_rules: Vec<HookRule>,
     pub timeout_ms: u64,
 }
@@ -778,7 +777,6 @@ impl HooksConfig {
                 post_tool_use_rules,
                 timeout_ms,
             }) => {
-                // Start with synthesized legacy rules (if provided)
                 let mut pre_rules = Vec::new();
                 if let Some(argv) = pre_tool_use.clone() {
                     pre_rules.push(HookRule {
@@ -793,7 +791,6 @@ impl HooksConfig {
                         matcher: HookToolMatcher::from_toml(post_tool_use_match.clone()),
                     });
                 }
-                // Append explicit rules from TOML
                 pre_rules.extend(HookRule::vec_from_toml(pre_tool_use_rules));
                 post_rules.extend(HookRule::vec_from_toml(post_tool_use_rules));
 
@@ -817,15 +814,6 @@ impl HooksConfig {
     }
 }
 
-impl From<ToolsToml> for Tools {
-    fn from(tools_toml: ToolsToml) -> Self {
-        Self {
-            web_search: tools_toml.web_search,
-            view_image: tools_toml.view_image,
-        }
-    }
-}
-
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct HooksToml {
     #[serde(default)]
@@ -836,29 +824,22 @@ pub struct HooksToml {
     pub user_prompt_submit: Option<Vec<String>>,
     #[serde(default)]
     pub stop: Option<Vec<String>>,
-    /// Optional matcher to restrict which tools trigger the pre hook.
     #[serde(default)]
     pub pre_tool_use_match: Option<HookToolMatchToml>,
-    /// Optional matcher to restrict which tools trigger the post hook.
     #[serde(default)]
     pub post_tool_use_match: Option<HookToolMatchToml>,
-    /// Multiple rules for pre‑tool hooks, each with its own argv and matcher.
     #[serde(default)]
     pub pre_tool_use_rules: Option<Vec<HookRuleToml>>,
-    /// Multiple rules for post‑tool hooks, each with its own argv and matcher.
     #[serde(default)]
     pub post_tool_use_rules: Option<Vec<HookRuleToml>>,
-    /// Optional timeout for hooks in milliseconds (default 10s).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookToolMatchToml {
-    /// Glob-style patterns ("apply_patch", "shell", "mcp:*", "*").
     #[serde(default)]
     pub include: Option<Vec<String>>,
-    /// Exclusion patterns applied after include match.
     #[serde(default)]
     pub exclude: Option<Vec<String>>,
 }
@@ -881,55 +862,19 @@ impl HookToolMatcher {
     }
 
     pub fn should_run_for(&self, tool: &str) -> bool {
-        // If include is empty, default to include all tools unless excluded.
         let included = if self.include.is_empty() {
             true
         } else {
-            self.include.iter().any(|p| wildcard_match(p, tool))
+            self.include.iter().any(|pat| wildcard_match(pat, tool))
         };
         if !included {
             return false;
         }
-        // Exclude overrides include when it matches.
-        if self.exclude.iter().any(|p| wildcard_match(p, tool)) {
+        if self.exclude.iter().any(|pat| wildcard_match(pat, tool)) {
             return false;
         }
         true
     }
-}
-
-fn wildcard_match(pat: &str, text: &str) -> bool {
-    // Supports '*' wildcard only.
-    if pat == "*" {
-        return true;
-    }
-    // Two-pointer greedy backtracking algorithm for '*' wildcard.
-    let (p_bytes, t_bytes) = (pat.as_bytes(), text.as_bytes());
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let (mut star_idx, mut match_idx) = (None::<usize>, 0usize);
-    while ti < t_bytes.len() {
-        if pi < p_bytes.len() && (p_bytes[pi] == b'?' || p_bytes[pi] == t_bytes[ti]) {
-            // '?' not used, but keep parity with typical wildcard; treat as literal match only.
-            pi += 1;
-            ti += 1;
-        } else if pi < p_bytes.len() && p_bytes[pi] == b'*' {
-            star_idx = Some(pi);
-            match_idx = ti;
-            pi += 1;
-        } else if let Some(si) = star_idx {
-            // Backtrack to last '*'
-            pi = si + 1;
-            match_idx += 1;
-            ti = match_idx;
-        } else {
-            return false;
-        }
-    }
-    // Consume remaining '*' in pattern
-    while pi < p_bytes.len() && p_bytes[pi] == b'*' {
-        pi += 1;
-    }
-    pi == p_bytes.len()
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -957,11 +902,50 @@ impl HookRule {
             },
         }
     }
+
     fn vec_from_toml(v: Option<Vec<HookRuleToml>>) -> Vec<Self> {
         v.unwrap_or_default()
             .into_iter()
             .map(Self::from_toml)
             .collect()
+    }
+}
+
+fn wildcard_match(pat: &str, text: &str) -> bool {
+    if pat == "*" {
+        return true;
+    }
+    let (p_bytes, t_bytes) = (pat.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_idx, mut match_idx) = (None::<usize>, 0usize);
+    while ti < t_bytes.len() {
+        if pi < p_bytes.len() && (p_bytes[pi] == b'?' || p_bytes[pi] == t_bytes[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p_bytes.len() && p_bytes[pi] == b'*' {
+            star_idx = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(si) = star_idx {
+            pi = si + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while pi < p_bytes.len() && p_bytes[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p_bytes.len()
+}
+
+impl From<ToolsToml> for Tools {
+    fn from(tools_toml: ToolsToml) -> Self {
+        Self {
+            web_search: tools_toml.web_search,
+            view_image: tools_toml.view_image,
+        }
     }
 }
 
@@ -1259,6 +1243,11 @@ impl Config {
             include_view_image_tool,
             active_profile: active_profile_name,
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
+            tui_notifications: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.notifications.clone())
+                .unwrap_or_default(),
             hooks: HooksConfig::from_toml(cfg.hooks.clone()),
         };
         Ok(config)
@@ -1370,10 +1359,12 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::config_types::HistoryPersistence;
+    use crate::config_types::Notifications;
 
     use super::*;
     use pretty_assertions::assert_eq;
 
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -1406,6 +1397,19 @@ persistence = "none"
             }),
             history_no_persistence_cfg.history
         );
+    }
+
+    #[test]
+    fn tui_config_missing_notifications_field_defaults_to_disabled() {
+        let cfg = r#"
+[tui]
+"#;
+
+        let parsed = toml::from_str::<ConfigToml>(cfg)
+            .expect("TUI config without notifications should succeed");
+        let tui = parsed.tui.expect("config should include tui section");
+
+        assert_eq!(tui.notifications, Notifications::Enabled(false));
     }
 
     #[test]
@@ -1485,7 +1489,8 @@ exclude_slash_tmp = true
                 command: "echo".to_string(),
                 args: vec!["hello".to_string()],
                 env: None,
-                startup_timeout_ms: None,
+                startup_timeout_sec: Some(Duration::from_secs(3)),
+                tool_timeout_sec: Some(Duration::from_secs(5)),
             },
         );
 
@@ -1496,11 +1501,35 @@ exclude_slash_tmp = true
         let docs = loaded.get("docs").expect("docs entry");
         assert_eq!(docs.command, "echo");
         assert_eq!(docs.args, vec!["hello".to_string()]);
+        assert_eq!(docs.startup_timeout_sec, Some(Duration::from_secs(3)));
+        assert_eq!(docs.tool_timeout_sec, Some(Duration::from_secs(5)));
 
         let empty = BTreeMap::new();
         write_global_mcp_servers(codex_home.path(), &empty)?;
         let loaded = load_global_mcp_servers(codex_home.path())?;
         assert!(loaded.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_global_mcp_servers_accepts_legacy_ms_field() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers]
+[mcp_servers.docs]
+command = "echo"
+startup_timeout_ms = 2500
+"#,
+        )?;
+
+        let servers = load_global_mcp_servers(codex_home.path())?;
+        let docs = servers.get("docs").expect("docs entry");
+        assert_eq!(docs.startup_timeout_sec, Some(Duration::from_millis(2500)));
 
         Ok(())
     }
@@ -1535,7 +1564,7 @@ exclude_slash_tmp = true
         tokio::fs::write(
             &config_path,
             r#"
-model = "gpt-5"
+model = "gpt-5-codex"
 model_reasoning_effort = "medium"
 
 [profiles.dev]
@@ -1610,7 +1639,7 @@ model = "gpt-4"
 model_reasoning_effort = "medium"
 
 [profiles.prod]
-model = "gpt-5"
+model = "gpt-5-codex"
 "#,
         )
         .await?;
@@ -1641,7 +1670,7 @@ model = "gpt-5"
                 .profiles
                 .get("prod")
                 .and_then(|profile| profile.model.as_deref()),
-            Some("gpt-5"),
+            Some("gpt-5-codex"),
         );
 
         Ok(())
@@ -1788,7 +1817,7 @@ model_verbosity = "high"
         assert_eq!(
             Config {
                 model: "o3".to_string(),
-                review_model: "gpt-5".to_string(),
+                review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
                 model_family: find_family_for_model("o3").expect("known model slug"),
                 model_context_window: Some(200_000),
                 model_max_output_tokens: Some(100_000),
@@ -1823,17 +1852,8 @@ model_verbosity = "high"
                 include_view_image_tool: true,
                 active_profile: Some("o3".to_string()),
                 disable_paste_burst: false,
-                hooks: HooksConfig {
-                    pre_tool_use: None,
-                    post_tool_use: None,
-                    user_prompt_submit: None,
-                    stop: None,
-                    pre_tool_use_match: Default::default(),
-                    post_tool_use_match: Default::default(),
-                    pre_tool_use_rules: Default::default(),
-                    post_tool_use_rules: Default::default(),
-                    timeout_ms: 10_000
-                },
+                tui_notifications: Default::default(),
+                hooks: HooksConfig::from_toml(None),
             },
             o3_profile_config
         );
@@ -1856,7 +1876,7 @@ model_verbosity = "high"
         )?;
         let expected_gpt3_profile_config = Config {
             model: "gpt-3.5-turbo".to_string(),
-            review_model: "gpt-5".to_string(),
+            review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
             model_family: find_family_for_model("gpt-3.5-turbo").expect("known model slug"),
             model_context_window: Some(16_385),
             model_max_output_tokens: Some(4_096),
@@ -1891,17 +1911,8 @@ model_verbosity = "high"
             include_view_image_tool: true,
             active_profile: Some("gpt3".to_string()),
             disable_paste_burst: false,
-            hooks: HooksConfig {
-                pre_tool_use: None,
-                post_tool_use: None,
-                user_prompt_submit: None,
-                stop: None,
-                pre_tool_use_match: Default::default(),
-                post_tool_use_match: Default::default(),
-                pre_tool_use_rules: Default::default(),
-                post_tool_use_rules: Default::default(),
-                timeout_ms: 10_000,
-            },
+            tui_notifications: Default::default(),
+            hooks: HooksConfig::from_toml(None),
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -1939,7 +1950,7 @@ model_verbosity = "high"
         )?;
         let expected_zdr_profile_config = Config {
             model: "o3".to_string(),
-            review_model: "gpt-5".to_string(),
+            review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
             model_family: find_family_for_model("o3").expect("known model slug"),
             model_context_window: Some(200_000),
             model_max_output_tokens: Some(100_000),
@@ -1974,17 +1985,8 @@ model_verbosity = "high"
             include_view_image_tool: true,
             active_profile: Some("zdr".to_string()),
             disable_paste_burst: false,
-            hooks: HooksConfig {
-                pre_tool_use: None,
-                post_tool_use: None,
-                user_prompt_submit: None,
-                stop: None,
-                pre_tool_use_match: Default::default(),
-                post_tool_use_match: Default::default(),
-                pre_tool_use_rules: Default::default(),
-                post_tool_use_rules: Default::default(),
-                timeout_ms: 10_000,
-            },
+            tui_notifications: Default::default(),
+            hooks: HooksConfig::from_toml(None),
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
@@ -2008,7 +2010,7 @@ model_verbosity = "high"
         )?;
         let expected_gpt5_profile_config = Config {
             model: "gpt-5".to_string(),
-            review_model: "gpt-5".to_string(),
+            review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
             model_family: find_family_for_model("gpt-5").expect("known model slug"),
             model_context_window: Some(272_000),
             model_max_output_tokens: Some(128_000),
@@ -2043,17 +2045,8 @@ model_verbosity = "high"
             include_view_image_tool: true,
             active_profile: Some("gpt5".to_string()),
             disable_paste_burst: false,
-            hooks: HooksConfig {
-                pre_tool_use: None,
-                post_tool_use: None,
-                user_prompt_submit: None,
-                stop: None,
-                pre_tool_use_match: Default::default(),
-                post_tool_use_match: Default::default(),
-                pre_tool_use_rules: Default::default(),
-                post_tool_use_rules: Default::default(),
-                timeout_ms: 10_000,
-            },
+            tui_notifications: Default::default(),
+            hooks: HooksConfig::from_toml(None),
         };
 
         assert_eq!(expected_gpt5_profile_config, gpt5_profile_config);
@@ -2155,5 +2148,48 @@ trust_level = "trusted"
         assert_eq!(contents, expected);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod notifications_tests {
+    use crate::config_types::Notifications;
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct TuiTomlTest {
+        notifications: Notifications,
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct RootTomlTest {
+        tui: TuiTomlTest,
+    }
+
+    #[test]
+    fn test_tui_notifications_true() {
+        let toml = r#"
+            [tui]
+            notifications = true
+        "#;
+        let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize notifications=true");
+        assert!(matches!(
+            parsed.tui.notifications,
+            Notifications::Enabled(true)
+        ));
+    }
+
+    #[test]
+    fn test_tui_notifications_custom_array() {
+        let toml = r#"
+            [tui]
+            notifications = ["foo"]
+        "#;
+        let parsed: RootTomlTest =
+            toml::from_str(toml).expect("deserialize notifications=[\"foo\"]");
+        assert!(matches!(
+            parsed.tui.notifications,
+            Notifications::Custom(ref v) if v == &vec!["foo".to_string()]
+        ));
     }
 }
